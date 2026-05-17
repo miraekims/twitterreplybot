@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "X Reply Bot",
+  "version": "0.1.0",
+  "description": "Modal-based automation for X.com replies (comments / search / by @username).",
+  "permissions": ["storage", "cookies", "scripting"],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://api.x.com/*",
+    "https://api.twitter.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["src/content/page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": [
+        "src/content/icons.js",
+        "src/content/modal.js",
+        "src/content/index.js"
+      ],
+      "css": ["src/content/modal.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "twitterreplybot@local",
+      "strict_min_version": "128.0"
+    }
+  }
+}

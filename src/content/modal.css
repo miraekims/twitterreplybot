@@ -1,0 +1,160 @@
+/* Scoped under #xbot-root to avoid leaking into x.com styles. */
+#xbot-root {
+  --xbot-bg: #15202b;
+  --xbot-bg-2: #1c2732;
+  --xbot-border: #38444d;
+  --xbot-fg: #e7e9ea;
+  --xbot-muted: #8899a6;
+  --xbot-accent: #1d9bf0;
+  --xbot-danger: #f4212e;
+  --xbot-ok: #00ba7c;
+  color-scheme: dark;
+}
+
+#xbot-fab {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--xbot-accent);
+  color: #fff;
+  border: none;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#xbot-fab svg { width: 24px; height: 24px; }
+#xbot-fab .xbot-badge {
+  position: absolute;
+  top: -2px; right: -2px;
+  min-width: 16px; height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--xbot-ok);
+  color: #fff;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  font-family: system-ui, sans-serif;
+}
+#xbot-fab .xbot-badge.warn { background: var(--xbot-danger); }
+
+#xbot-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 2147483646;
+  display: none;
+}
+#xbot-overlay.open { display: block; }
+
+#xbot-modal {
+  position: fixed;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(640px, 92vw);
+  max-height: 88vh;
+  background: var(--xbot-bg);
+  color: var(--xbot-fg);
+  border: 1px solid var(--xbot-border);
+  border-radius: 14px;
+  z-index: 2147483647;
+  display: none;
+  flex-direction: column;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+#xbot-modal.open { display: flex; }
+
+.xbot-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--xbot-border);
+}
+.xbot-header h2 { margin: 0; font-size: 15px; font-weight: 600; flex: 1; }
+.xbot-header button {
+  background: transparent; border: none; color: var(--xbot-muted);
+  cursor: pointer; padding: 4px; border-radius: 6px;
+}
+.xbot-header button:hover { color: var(--xbot-fg); background: var(--xbot-bg-2); }
+.xbot-header svg { width: 18px; height: 18px; display: block; }
+
+.xbot-tabs {
+  display: flex; gap: 4px;
+  padding: 8px 12px 0; border-bottom: 1px solid var(--xbot-border);
+}
+.xbot-tab {
+  background: transparent; border: none;
+  padding: 8px 12px; border-radius: 8px 8px 0 0;
+  color: var(--xbot-muted); cursor: pointer; font-size: 13px;
+}
+.xbot-tab.active { color: var(--xbot-fg); background: var(--xbot-bg-2); }
+
+.xbot-body {
+  padding: 16px; overflow-y: auto; flex: 1;
+}
+.xbot-pane { display: none; }
+.xbot-pane.active { display: block; }
+
+.xbot-row { display: flex; gap: 8px; margin-bottom: 10px; }
+.xbot-row > * { flex: 1; }
+
+.xbot-input, .xbot-textarea {
+  width: 100%;
+  background: var(--xbot-bg-2);
+  border: 1px solid var(--xbot-border);
+  border-radius: 8px;
+  color: var(--xbot-fg);
+  padding: 8px 10px;
+  font: inherit;
+  box-sizing: border-box;
+}
+.xbot-input:focus, .xbot-textarea:focus {
+  outline: none; border-color: var(--xbot-accent);
+}
+.xbot-textarea { resize: vertical; min-height: 72px; }
+
+.xbot-btn {
+  background: var(--xbot-accent); color: #fff;
+  border: none; border-radius: 8px;
+  padding: 8px 14px; cursor: pointer; font: inherit;
+}
+.xbot-btn.secondary { background: var(--xbot-bg-2); border: 1px solid var(--xbot-border); color: var(--xbot-fg); }
+.xbot-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.xbot-list { display: flex; flex-direction: column; gap: 8px; }
+.xbot-card {
+  background: var(--xbot-bg-2);
+  border: 1px solid var(--xbot-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.xbot-card .xbot-meta {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--xbot-muted); font-size: 12px; margin-bottom: 6px;
+}
+.xbot-card .xbot-meta strong { color: var(--xbot-fg); }
+.xbot-card .xbot-text { white-space: pre-wrap; word-break: break-word; }
+.xbot-card .xbot-actions { margin-top: 8px; display: flex; gap: 8px; }
+
+.xbot-status {
+  font-size: 12px;
+  color: var(--xbot-muted);
+  padding: 8px 16px;
+  border-top: 1px solid var(--xbot-border);
+  display: flex; gap: 12px; align-items: center;
+}
+.xbot-status .xbot-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--xbot-danger);
+}
+.xbot-status .xbot-dot.ok { background: var(--xbot-ok); }
+.xbot-status .xbot-dot.warn { background: #ffd400; }
+
+.xbot-empty { color: var(--xbot-muted); text-align: center; padding: 20px; }
+.xbot-error { color: var(--xbot-danger); font-size: 12px; margin-top: 6px; }
