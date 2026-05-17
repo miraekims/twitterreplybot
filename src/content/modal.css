@@ -158,3 +158,35 @@
 
 .xbot-empty { color: var(--xbot-muted); text-align: center; padding: 20px; }
 .xbot-error { color: var(--xbot-danger); font-size: 12px; margin-top: 6px; }
+
+
+/* --- auto-reply tab additions --- */
+.xbot-label { display: block; font-size: 12px; color: var(--xbot-muted); margin: 8px 0 4px; }
+.xbot-section { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--xbot-muted); margin: 14px 0 6px; border-top: 1px solid var(--xbot-border);
+  padding-top: 10px; }
+
+.xbot-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.xbot-grid .xbot-check, .xbot-grid .xbot-field { grid-column: span 1; }
+
+.xbot-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--xbot-muted); }
+.xbot-field input { width: 100%; box-sizing: border-box; }
+
+.xbot-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--xbot-fg); }
+.xbot-check input { accent-color: var(--xbot-accent); }
+
+.xbot-status-line { font-size: 12px; color: var(--xbot-muted); padding: 6px 8px;
+  background: var(--xbot-bg-2); border: 1px solid var(--xbot-border); border-radius: 8px; }
+.xbot-status-line.run { color: var(--xbot-ok); border-color: var(--xbot-ok); }
+
+.xbot-logs {
+  background: #0b1218; color: var(--xbot-fg);
+  border: 1px solid var(--xbot-border); border-radius: 8px;
+  padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; line-height: 1.5;
+  max-height: 180px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  margin: 0;
+}
+
+#xbot-fab .xbot-badge.run { background: var(--xbot-accent); }
+.xbot-status .xbot-dot.run { background: var(--xbot-accent); }

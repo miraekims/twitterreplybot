@@ -1,20 +1,14 @@
 // Service worker — message router.
-//
-// Inbound messages from content/modal:
-//   capture.observe { kind, data }    — forwarded GraphQL traffic from page-hook
-//   capture.state                     — return summary of what's captured
-//   x.tweetDetail   { tweetId }       — load replies under a tweet
-//   x.createTweet   { text, replyToTweetId } — post reply
-//
-// Every handler returns { ok: true, data } or { ok: false, error }.
 import { recordObservation, getAllOps, getHeaders } from './query-registry.js';
 import { tweetDetail, createTweet } from './x-api.js';
+import {
+  getConfig, setConfig, getState, getLogs, clearLogs,
+  start as autoStart, stop as autoStop, resetSent,
+} from '../core/auto-runner.js';
 
 const handlers = {
   'capture.observe': async ({ kind, data }) => {
-    if (kind === 'graphql-seen') {
-      await recordObservation(data);
-    }
+    if (kind === 'graphql-seen') await recordObservation(data);
     return { acknowledged: true };
   },
   'capture.state': async () => {
@@ -26,11 +20,21 @@ const handlers = {
     return {
       ops: summary,
       hasAuth: !!headers.authorization,
-      ready: !!ops.TweetDetail && !!ops.CreateTweet && !!headers.authorization,
+      ready: !!ops.SearchTimeline && !!ops.CreateTweet && !!headers.authorization,
     };
   },
+  // legacy (Comments tab — kept for later)
   'x.tweetDetail': (p) => tweetDetail(p),
   'x.createTweet': (p) => createTweet(p),
+  // auto-reply campaign
+  'auto.getConfig': () => getConfig(),
+  'auto.setConfig': (p) => setConfig(p || {}),
+  'auto.getState': () => getState(),
+  'auto.getLogs': () => getLogs(),
+  'auto.clearLogs': () => clearLogs(),
+  'auto.start': () => autoStart(),
+  'auto.stop': () => autoStop(),
+  'auto.resetSent': () => resetSent(),
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -43,5 +47,5 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     .then(() => fn(msg.payload || {}))
     .then((data) => sendResponse({ ok: true, data }))
     .catch((err) => sendResponse({ ok: false, error: err && err.message ? err.message : String(err) }));
-  return true; // async response
+  return true;
 });

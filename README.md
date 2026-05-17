@@ -1,51 +1,67 @@
 # X Reply Bot (MV3)
 
-Browser-extension-based modal for automating replies on X.com.
+Browser-extension modal that auto-replies to X.com posts matching your keywords,
+using your reply templates.
 
-> **Status:** v0.1 skeleton — Comments tab is wired end-to-end, the rest is stubbed.
-> Telegram bridge, AI replies, rules engine and rate-limit queue are next.
+> **v0.2** — Auto-reply campaign is the main flow.
+> Comments tab is kept (single-tweet replies) for later use.
+> Telegram bridge, AI rewriting, likes/follows are next.
 
-## How it works (short version)
+## What it does
 
-1. A page-world hook (`src/content/page-hook.js`) silently observes every X.com
-   GraphQL request and forwards `(operationName, queryId, headers, variables, features, body)`
-   to the service worker.
-2. The service worker stores the **latest** request shape per operation in
-   `chrome.storage.local`. This means we never hardcode `queryId` / GraphQL
-   `features` — they self-heal whenever X ships a frontend release.
-3. When you trigger a feature in the modal, the SW replays the last seen
-   request for that operation, swapping only the fields we need to change
-   (e.g. `focalTweetId`, `tweet_text`, `reply.in_reply_to_tweet_id`).
-4. CSRF (`x-csrf-token`) is always re-read from the `ct0` cookie at send time
-   so it can never go stale.
+You provide:
+- a list of **keywords** (e.g. `gm`, `gm degens`, `#crypto`, `$BTC`)
+- a list of **reply templates** (one per line, plain text or with `{author}` / `{name}`)
 
-## Loading the extension
+The extension:
+1. Searches X for tweets matching ANY keyword (Latest tab) every N seconds.
+2. Filters out: replies, retweets, posts older than X minutes, posts under your
+   liked/followers thresholds, optionally posts containing links.
+3. Skips tweets it has already replied to (persistent dedup).
+4. Picks a random template, renders it, and posts a reply under the tweet.
+5. Sleeps a jittered delay between actions.
+6. Hard-stops on `401`/`403`/`429` so you can't spam yourself into a ban.
+
+## Self-healing X client
+
+We never hardcode `queryId` or GraphQL `features`. A page-world hook
+(`src/content/page-hook.js`) observes the live requests X.com makes and stores
+the latest shape per operation. When you press Start, the service worker replays
+that exact shape, swapping only what we need to change (search query, tweet
+text, reply target). When X ships a frontend update, the next time you load
+x.com the new shape is captured and we keep working.
+
+## Loading
 
 ### Chrome / Brave / Edge
-
-1. Go to `chrome://extensions`.
-2. Enable **Developer mode** (top right).
-3. Click **Load unpacked** and pick this repo's root folder.
-4. Open `https://x.com`. You should see a blue floating bot button in the
-   bottom-right corner.
+1. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → repo root.
+2. Open `https://x.com`. Blue floating bot button appears bottom-right.
 
 ### Firefox
+1. `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → `manifest.json`.
 
-1. Go to `about:debugging#/runtime/this-firefox`.
-2. Click **Load Temporary Add-on…** and pick `manifest.json`.
-3. Open `https://x.com`.
+## Warm-up (do this once after install)
 
-## Warm-up
+Badge says `2`. Two operations to capture:
 
-The first time you install, the modal will say
-**"Warming up — browse X to capture endpoints"**.
+1. **SearchTimeline** — type anything in X's search bar and press Enter.
+2. **CreateTweet** — post or reply to anything once.
 
-Trigger each operation **once** while logged in:
+Badge changes to `OK`. Now the **Auto-reply** tab can run.
 
-- `TweetDetail` — open any tweet permalink (`x.com/<user>/status/<id>`).
-- `CreateTweet` — post or reply to anything once.
+## Auto-reply tab
 
-After that, the floating button shows `OK` and the Comments tab works.
+- **Keywords** — one per line. They go straight into X's search.
+- **Templates** — one per line, picked randomly per reply. Supports
+  `{author}` (handle) and `{name}` (display name).
+- **Filters** — min likes, max age in minutes, min author followers,
+  language list, skip replies/retweets/links.
+- **Pacing** — min/max delay between replies (jittered), how often to re-search,
+  session cap (auto-stop after N replies).
+- **Save / Start / Stop / Reset history** — config persists across page reloads;
+  history of replied tweets is kept in `chrome.storage.local`.
+
+The floating button shows the count of replies sent in the current session.
 
 ## Project layout
 
@@ -53,27 +69,26 @@ After that, the floating button shows `OK` and the Comments tab works.
 manifest.json
 src/
   background/
-    index.js          # service worker / message router
-    x-api.js          # GraphQL client (TweetDetail, CreateTweet)
-    query-registry.js # stores latest seen request shape per op
+    index.js          # SW message router
+    x-api.js          # GraphQL client (TweetDetail, SearchTimeline, CreateTweet)
+    query-registry.js # latest seen request shape per op
   content/
     page-hook.js      # MAIN-world fetch/XHR observer
-    index.js          # isolated-world entry, bridges to background
-    modal.js          # modal UI logic
-    modal.css         # scoped styles
-    icons.js          # inline SVG icons
+    index.js          # bridge to background, boots UI
+    modal.js          # tabs: auto / comments / status
+    modal.css
+    icons.js
   core/
     storage.js        # chrome.storage.local wrapper
-    crypto.js         # AES-GCM helpers (for upcoming telegram/AI secrets)
+    crypto.js         # AES-GCM (for upcoming TG/AI secrets)
+    auto-runner.js    # search → filter → reply loop
 ```
 
 ## Roadmap
 
-- [ ] Search/Feed automation (keywords, filters, batch reply)
-- [ ] Reply by @username (walk a list of profiles)
-- [ ] Rate-limit queue with jitter + per-hour caps
-- [ ] Reply templates with variables (`{author}`, `{quote}`)
-- [ ] Optional AI rewriting (OpenAI / Anthropic) using passphrase-encrypted key
-- [ ] Telegram bot bridge (long-poll from the SW; control from your phone)
-- [ ] Like / Follow actions
-- [ ] Logs viewer + CSV export
+- [ ] AI rewriting (so each reply is unique even from the same template)
+- [ ] Telegram bot bridge (control / start / stop / logs from your phone)
+- [ ] Likes + follows automation
+- [ ] Keyword groups with per-group templates
+- [ ] CSV export of logs
+- [ ] Smarter Comments tab (filter, batch reply, keyword match inside replies)
