@@ -3,7 +3,7 @@
   "name": "X Reply Bot",
   "version": "0.1.0",
   "description": "Modal-based automation for X.com replies (comments / search / by @username).",
-  "permissions": ["storage", "cookies", "scripting"],
+  "permissions": ["storage", "cookies", "scripting", "alarms"],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",

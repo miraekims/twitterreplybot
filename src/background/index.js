@@ -4,7 +4,11 @@ import { tweetDetail, createTweet } from './x-api.js';
 import {
   getConfig, setConfig, getState, getLogs, clearLogs,
   start as autoStart, stop as autoStop, resetSent,
+  registerAlarmHandler,
 } from '../core/auto-runner.js';
+
+// Register at top level so the SW re-registers on every wake-up.
+registerAlarmHandler();
 
 const handlers = {
   'capture.observe': async ({ kind, data }) => {

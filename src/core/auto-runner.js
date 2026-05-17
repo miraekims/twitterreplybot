@@ -1,32 +1,33 @@
-// Auto-reply runner.
+// Auto-reply runner. MV3-safe: tick-based via chrome.alarms.
 //
-// Lives in the service worker. Given a campaign config:
-//   { keywords:[], templates:[], filters:{...}, pacing:{...}, sessionCap }
-// it loops:
-//   1. search X for tweets matching ANY keyword
-//   2. drop tweets that don't pass filters or were already replied to
-//   3. pick a random unused template, send reply
-//   4. wait jittered delay, repeat
+// In Manifest V3 the service worker is killed after ~30s of inactivity.
+// A long-running setTimeout/setInterval loop would die silently. Instead,
+// each step is one alarm tick:
 //
-// State:
-//   - status: 'idle' | 'running' | 'paused' | 'stopped'
-//   - sentIds: Set of tweet ids we've already replied to (persisted)
-//   - logs: ring buffer of recent actions/errors
+//   tick:
+//     1. read state from storage (state survives SW restarts)
+//     2. decide next action (search | reply | sleep)
+//     3. perform exactly one action
+//     4. schedule the next alarm and return
 //
-// Hard stop on auth failures (401/403/429): we never keep firing into a wall.
+// State machine (persisted in storage):
+//   status:         'idle' | 'running' | 'stopped'
+//   queue:          [{ id, authorHandle, authorName, _matchedKeyword, ... }]
+//   sentInSession:  number
+//   lastSearchAt:   epoch ms
+//   nextActionAt:   epoch ms (when the next tick should do something)
+//   lastError:      string | null
 import { searchTimeline, createTweet } from '../background/x-api.js';
 import { storage } from './storage.js';
 
-const STATE_KEY = 'auto.state';
-const SENT_KEY = 'auto.sent';      // { [tweetId]: ts }
-const LOGS_KEY = 'auto.logs';      // [{ ts, level, msg }]
+const STATE_KEY  = 'auto.state';
+const SENT_KEY   = 'auto.sent';     // { [tweetId]: ts }
+const LOGS_KEY   = 'auto.logs';     // [{ ts, level, msg }]
 const CONFIG_KEY = 'auto.config';
+const ALARM_NAME = 'xbot.autoTick';
 
 const MAX_LOGS = 200;
 const MAX_SENT = 5000;
-
-let runningTimer = null;
-let abortFlag = false;
 
 const defaultConfig = {
   keywords: [],
@@ -38,14 +39,14 @@ const defaultConfig = {
     skipRetweets: true,
     skipWithUrls: false,
     minAuthorFollowers: 0,
-    langs: [], // e.g. ['en']
+    langs: [],
   },
   pacing: {
     minDelaySec: 25,
     maxDelaySec: 60,
-    searchEverySec: 180, // re-run search every N seconds
+    searchEverySec: 180,
   },
-  sessionCap: 30, // max replies before auto-stop
+  sessionCap: 30,
 };
 
 const defaultState = {
@@ -53,10 +54,12 @@ const defaultState = {
   startedAt: null,
   sentInSession: 0,
   lastError: null,
-  lastSearchAt: null,
-  queue: [], // tweet ids pending reply
+  lastSearchAt: 0,
+  nextActionAt: 0,
+  queue: [],
 };
 
+// ---------- config / state ----------
 export async function getConfig() {
   return { ...defaultConfig, ...(await storage.get(CONFIG_KEY, {})) };
 }
@@ -66,7 +69,7 @@ export async function setConfig(patch) {
     ...cur,
     ...patch,
     filters: { ...cur.filters, ...(patch.filters || {}) },
-    pacing: { ...cur.pacing, ...(patch.pacing || {}) },
+    pacing:  { ...cur.pacing,  ...(patch.pacing  || {}) },
   };
   await storage.set(CONFIG_KEY, next);
   return next;
@@ -81,6 +84,7 @@ async function setState(patch) {
   return next;
 }
 
+// ---------- logs ----------
 async function log(level, msg) {
   const entry = { ts: Date.now(), level, msg };
   await storage.update(LOGS_KEY, (cur) => {
@@ -89,11 +93,10 @@ async function log(level, msg) {
     return arr;
   }, []);
 }
-export async function getLogs() {
-  return (await storage.get(LOGS_KEY, [])) || [];
-}
+export async function getLogs() { return (await storage.get(LOGS_KEY, [])) || []; }
 export async function clearLogs() { await storage.set(LOGS_KEY, []); }
 
+// ---------- dedup ----------
 async function isAlreadySent(id) {
   const sent = (await storage.get(SENT_KEY, {})) || {};
   return !!sent[id];
@@ -102,7 +105,6 @@ async function markSent(id) {
   await storage.update(SENT_KEY, (cur) => {
     const obj = cur || {};
     obj[id] = Date.now();
-    // Trim if too big.
     const keys = Object.keys(obj);
     if (keys.length > MAX_SENT) {
       keys.sort((a, b) => obj[a] - obj[b]);
@@ -112,12 +114,12 @@ async function markSent(id) {
   }, {});
 }
 
-function jitterMs(minSec, maxSec) {
-  const lo = Math.max(1, minSec | 0);
-  const hi = Math.max(lo, maxSec | 0);
-  return (lo + Math.random() * (hi - lo)) * 1000;
+// ---------- helpers ----------
+function jitterSec(min, max) {
+  const lo = Math.max(1, min | 0);
+  const hi = Math.max(lo, max | 0);
+  return lo + Math.random() * (hi - lo);
 }
-
 function passesFilters(t, f) {
   if (!t || !t.id || !t.text) return false;
   if (f.skipReplies && t.isReply) return false;
@@ -132,131 +134,187 @@ function passesFilters(t, f) {
   }
   return true;
 }
-
 function renderTemplate(tpl, ctx) {
   return tpl.replace(/\{(\w+)\}/g, (_, k) => (ctx[k] != null ? String(ctx[k]) : ''));
 }
-
 function pickTemplate(templates) {
   if (!templates || !templates.length) return null;
   return templates[Math.floor(Math.random() * templates.length)];
 }
 
-// --- search & reply loop ---
-async function searchPhase(cfg) {
-  const seenIds = new Set();
+// ---------- alarms ----------
+async function scheduleNext(delaySec) {
+  const when = Date.now() + Math.max(1, delaySec) * 1000;
+  await setState({ nextActionAt: when });
+  // chrome.alarms minimum is technically 30s in production builds, but in
+  // unpacked dev mode any positive delayInMinutes works. We use `when:` so
+  // we can pass an absolute timestamp without rounding.
+  chrome.alarms.create(ALARM_NAME, { when });
+}
+async function clearAlarm() {
+  await chrome.alarms.clear(ALARM_NAME);
+}
+
+// ---------- core tick ----------
+// One tick = one decision + one action. Never blocks for long.
+export async function tick() {
+  const state = await getState();
+  if (state.status !== 'running') {
+    await clearAlarm();
+    return;
+  }
+  const cfg = await getConfig();
+
+  // Validation guards.
+  if (!cfg.keywords.length || !cfg.templates.length) {
+    await log('error', 'no keywords or templates — stopping');
+    await stop();
+    return;
+  }
+  if (state.sentInSession >= cfg.sessionCap) {
+    await log('info', `session cap reached (${cfg.sessionCap}) — stopping`);
+    await stop();
+    return;
+  }
+
+  // 1) Queue empty? Run search and refill.
+  if (!state.queue.length) {
+    const sinceSearch = Date.now() - (state.lastSearchAt || 0);
+    if (sinceSearch < cfg.pacing.searchEverySec * 1000) {
+      const wait = Math.ceil((cfg.pacing.searchEverySec * 1000 - sinceSearch) / 1000);
+      await scheduleNext(wait);
+      return;
+    }
+    let candidates = [];
+    try {
+      candidates = await runSearch(cfg);
+    } catch (e) {
+      await log('error', `search blocked: ${e.message}`);
+      if (e.status === 401 || e.status === 403 || e.status === 429) {
+        await setState({ lastError: e.message });
+        await stop();
+        return;
+      }
+      // soft failure — try again later
+      await scheduleNext(jitterSec(15, 30));
+      return;
+    }
+    // Filter + dedup.
+    const usable = [];
+    for (const t of candidates) {
+      if (!passesFilters(t, cfg.filters)) continue;
+      if (await isAlreadySent(t.id)) continue;
+      usable.push(t);
+    }
+    await setState({ queue: usable, lastSearchAt: Date.now() });
+    await log('info', `search → ${candidates.length} found, ${usable.length} usable`);
+    // Even if usable=0, schedule next tick so the loop keeps going.
+    const delay = usable.length
+      ? jitterSec(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec)
+      : cfg.pacing.searchEverySec;
+    await scheduleNext(delay);
+    return;
+  }
+
+  // 2) Pop one tweet from the queue and reply.
+  const queue = state.queue.slice();
+  const t = queue.shift();
+  await setState({ queue });
+
+  // Race-condition guard: someone may have replied between search and now.
+  if (await isAlreadySent(t.id)) {
+    await scheduleNext(2);
+    return;
+  }
+
+  const tpl = pickTemplate(cfg.templates);
+  const text = renderTemplate(tpl, {
+    author: t.authorHandle || '',
+    name:   t.authorName   || '',
+  });
+
+  try {
+    await createTweet({ text, replyToTweetId: t.id });
+    await markSent(t.id);
+    const s = await getState();
+    await setState({ sentInSession: s.sentInSession + 1 });
+    await log('info', `replied to @${t.authorHandle} (${t.id}) [kw="${t._matchedKeyword}"]`);
+  } catch (e) {
+    await log('error', `reply to ${t.id} failed: ${e.message}`);
+    // Mark as sent so we don't retry the same broken tweet forever.
+    await markSent(t.id);
+    if (e.status === 401 || e.status === 403 || e.status === 429) {
+      await setState({ lastError: e.message });
+      await stop();
+      return;
+    }
+  }
+
+  // Re-check session cap after sending.
+  const s2 = await getState();
+  if (s2.sentInSession >= cfg.sessionCap) {
+    await log('info', `session cap reached (${cfg.sessionCap}) — stopping`);
+    await stop();
+    return;
+  }
+  await scheduleNext(jitterSec(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec));
+}
+
+async function runSearch(cfg) {
+  const seen = new Set();
   const all = [];
   for (const kw of cfg.keywords) {
-    if (abortFlag) return all;
     try {
       const { tweets } = await searchTimeline({ query: kw, count: 20, product: 'Latest' });
       for (const t of tweets) {
-        if (!seenIds.has(t.id)) { seenIds.add(t.id); all.push({ ...t, _matchedKeyword: kw }); }
+        if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _matchedKeyword: kw }); }
       }
-      await log('info', `search "${kw}" -> ${tweets.length} tweets`);
     } catch (e) {
-      await log('error', `search "${kw}" failed: ${e.message}`);
+      // Hard errors must propagate so the caller can hard-stop.
       if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
+      await log('warn', `search "${kw}" failed: ${e.message}`);
     }
-    await sleep(jitterMs(2, 5));
+    // Tiny pause between keyword searches; not the main pacing.
+    await new Promise((r) => setTimeout(r, 800 + Math.random() * 800));
   }
-  await setState({ lastSearchAt: Date.now() });
   return all;
 }
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-async function loop() {
-  abortFlag = false;
-  await setState({ status: 'running', startedAt: Date.now(), sentInSession: 0, lastError: null });
-  await log('info', 'auto-reply started');
-
-  while (!abortFlag) {
-    const cfg = await getConfig();
-    const state = await getState();
-
-    if (!cfg.keywords.length || !cfg.templates.length) {
-      await log('error', 'no keywords or templates configured — stopping');
-      break;
-    }
-    if (state.sentInSession >= cfg.sessionCap) {
-      await log('info', `session cap reached (${cfg.sessionCap}) — stopping`);
-      break;
-    }
-
-    let candidates;
-    try {
-      candidates = await searchPhase(cfg);
-    } catch (e) {
-      await log('error', `search blocked: ${e.message} — hard stop`);
-      await setState({ lastError: e.message });
-      break;
-    }
-
-    let actedThisCycle = 0;
-    for (const t of candidates) {
-      if (abortFlag) break;
-      if (!passesFilters(t, cfg.filters)) continue;
-      if (await isAlreadySent(t.id)) continue;
-
-      const tpl = pickTemplate(cfg.templates);
-      const text = renderTemplate(tpl, {
-        author: t.authorHandle || '',
-        name: t.authorName || '',
-      });
-
-      try {
-        await createTweet({ text, replyToTweetId: t.id });
-        await markSent(t.id);
-        const s = await getState();
-        await setState({ sentInSession: s.sentInSession + 1 });
-        actedThisCycle++;
-        await log('info', `replied to @${t.authorHandle} (${t.id}) [kw="${t._matchedKeyword}"]`);
-      } catch (e) {
-        await log('error', `reply to ${t.id} failed: ${e.message}`);
-        if (e.status === 401 || e.status === 403 || e.status === 429) {
-          await setState({ lastError: e.message });
-          await log('error', 'auth/rate-limit error — hard stop');
-          abortFlag = true;
-          break;
-        }
-        // mark sent anyway so we don't keep trying the same tweet forever
-        await markSent(t.id);
-      }
-
-      const s2 = await getState();
-      if (s2.sentInSession >= cfg.sessionCap) { abortFlag = true; break; }
-
-      await sleep(jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec));
-    }
-
-    if (abortFlag) break;
-    if (actedThisCycle === 0) {
-      await log('info', 'no new matches this cycle, sleeping before next search');
-    }
-    await sleep(Math.max(15000, (cfg.pacing.searchEverySec | 0) * 1000));
-  }
-
-  await setState({ status: 'idle' });
-  await log('info', 'auto-reply stopped');
-}
-
+// ---------- public controls ----------
 export async function start() {
   const s = await getState();
   if (s.status === 'running') return s;
-  loop().catch(async (e) => {
-    await log('error', 'fatal: ' + e.message);
-    await setState({ status: 'idle', lastError: e.message });
+  await setState({
+    status: 'running',
+    startedAt: Date.now(),
+    sentInSession: 0,
+    lastError: null,
+    lastSearchAt: 0,
+    queue: [],
   });
+  await log('info', 'auto-reply started');
+  await scheduleNext(2);
   return getState();
 }
 export async function stop() {
-  abortFlag = true;
   await setState({ status: 'idle' });
-  await log('info', 'stop requested');
+  await clearAlarm();
+  await log('info', 'auto-reply stopped');
   return getState();
 }
 export async function resetSent() {
   await storage.set(SENT_KEY, {});
   await log('info', 'sent-history cleared');
+}
+
+// Wire alarms to tick(). The SW may have just woken up; calling tick() is safe
+// because all state is in storage.
+export function registerAlarmHandler() {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== ALARM_NAME) return;
+    tick().catch(async (e) => {
+      await log('error', 'tick crashed: ' + (e && e.message ? e.message : String(e)));
+      await setState({ status: 'idle', lastError: String(e && e.message || e) });
+    });
+  });
 }

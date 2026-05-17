@@ -64,7 +64,11 @@ export async function tweetDetail({ tweetId }) {
   const resp = await fetch(url.toString(), {
     method: 'GET', credentials: 'include', headers,
   });
-  if (!resp.ok) throw new Error(`TweetDetail HTTP ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`TweetDetail HTTP ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
   const data = await resp.json();
   return { replies: extractReplies(data, tweetId), raw: data };
 }
@@ -100,7 +104,11 @@ export async function searchTimeline({ query, count = 20, product = 'Latest' }) 
   const resp = await fetch(url.toString(), {
     method: 'GET', credentials: 'include', headers,
   });
-  if (!resp.ok) throw new Error(`SearchTimeline HTTP ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`SearchTimeline HTTP ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
   const data = await resp.json();
   return { tweets: extractTweets(data), raw: data };
 }
