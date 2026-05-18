@@ -13,33 +13,27 @@
 // pass valid cookies when fetching x.com/home, otherwise we get nothing back.
 //
 // FAILURE MODE WE FIGHT HERE: xclienttransaction@0.0.2 ships a strict regex
-// `(\w\[(\d{1,2})\],\s*16\))` to extract KEY_BYTE indices from the ondemand
-// bundle. When X's minifier shape changes (new identifier patterns, switch
-// to `+("0x"+x[i])` instead of `parseInt(..., 16)`, etc.), the regex returns
-// nothing and the constructor throws "Couldn't get KEY_BYTE indices". The
-// previous version of this file tried to monkey-patch
-// `ClientTransaction.prototype.getIndices` but that path was never invoked
-// (in the published build, the method is captured as an instance arrow-fn
-// in the constructor, before our prototype override is ever consulted). The
-// SHORT error in your prod logs ("refresh failed: Couldn't get KEY_BYTE
-// indices") instead of our longer patched message confirmed this.
+// (variants of `(\w\[(\d{1,2})\],\s*16\))`) to extract KEY_BYTE indices from
+// the ondemand bundle. When X's minifier shape changes (multi-char
+// identifiers, switch to `Number("0x"+x[i])` / `+x[i]` instead of
+// `parseInt(...,16)`, indices stored on a different object, etc.), the regex
+// returns nothing and the constructor throws "Couldn't get KEY_BYTE indices".
 //
-// Strategy now:
+// Strategy:
 //   1. Subclass the original constructor (via `class extends`) and pre-
 //      process the ondemand JS text inside our subclass constructor before
-//      calling super(). This runs BEFORE the lib reads the text, so it
-//      doesn't matter where getIndices is defined inside the lib. We need
+//      calling super(). This rewrites several known shapes back to the
+//      canonical `(x[N],16)` form so the lib's regex matches. We need
 //      `class extends` (not `function` + `.call`) because the lib ships
-//      ClientTransaction as a real ES6 class — `.call(this,...)` throws
-//      "Class constructor cannot be invoked without 'new'".
-//   2. Keep an exponential backoff on refreshes — when the bundle truly
-//      changes shape (algorithmic, not just identifier renames), nothing we
-//      do here recovers it; we MUST stop hammering the WAF every 5 seconds
-//      and let the static-header fallback carry traffic until someone
-//      pastes a new captured op.
-//   3. Optional debug dump: set XBOT_TXID_DEBUG=1 to write the last fetched
-//      x.com HTML and ondemand.js to /app/data/last-txid-fetch/ so you can
-//      inspect what shape X is currently serving without entering the box.
+//      ClientTransaction as a real ES6 class — `.call(this,...)` throws.
+//   2. On failure, ALWAYS dump fetched HTML + ondemand.js to
+//      /app/data/last-txid-fetch/ — the only way to diagnose a regex miss
+//      from outside the container is to actually look at the bundle. The
+//      first 200 bytes of ondemand.js are also logged at WARN level so
+//      `docker logs --tail` shows enough to recognise major shape changes
+//      without copying files out.
+//   3. Exponential 5min->4h backoff so we don't hammer the WAF every 5s
+//      tick when we can't make progress.
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -68,32 +62,57 @@ let _cookies = null;            // populated by first authenticated caller
 let lastRefreshAttemptAt = 0;
 let consecutiveFailures = 0;
 let _lastFailureMessage = null; // dedup repeated identical errors in logs
+let _dumpedThisSession = false; // dump files only once per process (size guard)
 
 // --- ondemand.js preprocessor ------------------------------------------------
 //
-// The lib's regex needs `<single-word-char>[<digit>],16)` to find KEY_BYTE
-// indices. Modern minifiers emit several variants we must canonicalise:
+// Best-effort: rewrite known minifier output shapes back to the canonical
+// `parseInt(x[N], 16)` form the lib's regex expects. We do NOT require the
+// match to be wrapped in `(...)` — the lib's regex matches `\w[N],16)`
+// anywhere, so an unwrapped `,parseInt(abc[5],16)` after a comma is fine
+// once we collapse the identifier.
 //
-//   ab[5], 16)    → a[5],16)         (multi-char identifier; keep last char)
-//   abc[12], 16)  → c[12],16)
-//   x[3] , 16 )   → x[3],16)         (extra whitespace)
+// Patterns we handle (in order):
 //
-// We intentionally do NOT attempt to recover from algorithmic shape changes
-// (e.g. switch to `+("0x"+x[i])`); those need a code update to the lib, and
-// hammering retries against the WAF in the meantime is a fast track to a
-// 401. In that case we let consecutiveFailures tick up and fall back to the
-// static header from captured-ops.json.
+//   A. Multi-char identifier inside parseInt: `parseInt(abc[5], 16)`
+//      → `parseInt(c[5],16)` (rename identifier to its last char,
+//      whitespace removed).
+//
+//   B. `Number("0x"+x[i])`     → `parseInt(x[i],16)` (X 2025+ minifiers
+//      sometimes emit Number+hex-string concat instead of parseInt).
+//
+//   C. `+("0x"+x[i])` or `+("0x"+abc[5])` → `parseInt(x[i],16)` (pure
+//      unary-plus coercion variant).
+//
+// If after preprocessing the lib STILL can't find indices, X changed
+// something deeper (e.g. indices are now stored on an object property or
+// computed from a different source). Then we need to patch the lib itself
+// or roll our own algorithm — neither is something the bot can do in the
+// field. Hence the always-on debug dump.
 function preprocessOndemand(src) {
   if (!src || typeof src !== 'string') return src;
-  // Collapse `(  abc[NN] , 16 )` → `(c[NN],16)` while preserving overall
-  // length roughly. We anchor on the opening `(` so the lib's regex, which
-  // requires `(\w[..],16)` with no leading whitespace, can match. Capture
-  // the LAST identifier char (idiomatic minified output single-char would
-  // also match).
-  return src.replace(
-    /\(\s*([A-Za-z_$][\w$]{1,})(\[\s*\d{1,3}\s*\])\s*,\s*16\s*\)/g,
-    (_, ident, idx) => `(${ident.slice(-1)}${idx.replace(/\s+/g, '')},16)`,
+  let s = src;
+
+  // (A) Multi-char identifier in parseInt(..., 16). Anchor on `,16)` rather
+  //     than a leading `(`, since the lib's regex doesn't require one.
+  s = s.replace(
+    /([A-Za-z_$][\w$]{1,})(\[\s*\d{1,3}\s*\])\s*,\s*16\s*\)/g,
+    (_, ident, idx) => `${ident.slice(-1)}${idx.replace(/\s+/g, '')},16)`,
   );
+
+  // (B) Number("0x"+x[i]) / Number("0x" + x[i])
+  s = s.replace(
+    /Number\(\s*["']0x["']\s*\+\s*([A-Za-z_$][\w$]*)(\[\s*\d{1,3}\s*\])\s*\)/g,
+    (_, ident, idx) => `parseInt(${ident.slice(-1)}${idx.replace(/\s+/g, '')},16)`,
+  );
+
+  // (C) +("0x"+x[i]) — unary-plus coercion of "0x"+digit string
+  s = s.replace(
+    /\+\s*\(\s*["']0x["']\s*\+\s*([A-Za-z_$][\w$]*)(\[\s*\d{1,3}\s*\])\s*\)/g,
+    (_, ident, idx) => `parseInt(${ident.slice(-1)}${idx.replace(/\s+/g, '')},16)`,
+  );
+
+  return s;
 }
 
 async function loadLib() {
@@ -156,19 +175,32 @@ function findOndemandUrl(html) {
   return null;
 }
 
-function maybeDumpDebug(html, ondemandJs, ondemandUrl) {
-  if (process.env.XBOT_TXID_DEBUG !== '1') return;
+// Always-on diagnostic dump on failure, capped to one set of files per
+// process boot to avoid disk leak. The bot's data/ dir is a docker volume,
+// so the dump survives a `docker compose down` — easy `docker cp` out.
+function dumpForDebug(html, ondemandJs, ondemandUrl, reason) {
+  if (_dumpedThisSession) return;
+  _dumpedThisSession = true;
   try {
     fs.mkdirSync(DEBUG_DUMP_DIR, { recursive: true });
     if (html != null) fs.writeFileSync(path.join(DEBUG_DUMP_DIR, 'home.html'), html);
     if (ondemandJs != null) fs.writeFileSync(path.join(DEBUG_DUMP_DIR, 'ondemand.js'), ondemandJs);
     if (ondemandUrl) fs.writeFileSync(path.join(DEBUG_DUMP_DIR, 'ondemand.url'), ondemandUrl);
-    logger.info('txid', `debug dump written to ${DEBUG_DUMP_DIR}`);
+    fs.writeFileSync(path.join(DEBUG_DUMP_DIR, 'reason.txt'),
+      `${new Date().toISOString()}\n${reason}\n`);
+    logger.info(
+      'txid',
+      `debug dump written to ${DEBUG_DUMP_DIR}/ — ` +
+      '`docker cp x-bot:/app/data/last-txid-fetch ./` to inspect',
+    );
   } catch (e) {
     logger.warn('txid', `debug dump failed: ${e.message}`);
   }
 }
 
+// Note about logging shape: only emit a WARN line when the failure message
+// changes, or every Nth identical failure. Otherwise repeated identical
+// failures spam the logs at the supervisor's 5-second tick.
 // Note about logging shape: only emit a WARN line when the failure message
 // changes, or every Nth identical failure. Otherwise repeated identical
 // failures spam the logs at the supervisor's 5-second tick.
@@ -207,21 +239,21 @@ async function refreshCache() {
     html = await curlGet('https://x.com/home', _cookies);
     if (!html || html.length < 1000) {
       noteFailure(`x.com HTML too short (${html?.length || 0} bytes); cookies may be expired`);
-      maybeDumpDebug(html, null, null);
+      dumpForDebug(html, null, null, 'x.com HTML too short');
       return false;
     }
 
     ondemandUrl = findOndemandUrl(html);
     if (!ondemandUrl) {
       noteFailure('could not find ondemand.js URL in x.com HTML');
-      maybeDumpDebug(html, null, null);
+      dumpForDebug(html, null, null, 'no ondemand URL');
       return false;
     }
 
     ondemandJs = await curlGet(ondemandUrl, _cookies);
     if (!ondemandJs || ondemandJs.length < 100) {
       noteFailure(`ondemand.js too short (${ondemandJs?.length || 0} bytes)`);
-      maybeDumpDebug(html, ondemandJs, ondemandUrl);
+      dumpForDebug(html, ondemandJs, ondemandUrl, 'ondemand.js too short');
       return false;
     }
 
@@ -237,7 +269,21 @@ async function refreshCache() {
     return true;
   } catch (e) {
     noteFailure(e.message);
-    maybeDumpDebug(html, ondemandJs, ondemandUrl);
+    // On a regex miss we get the LIBRARY's stack here, which usually doesn't
+    // tell us anything useful. The dump (and the first 200b log line below)
+    // is the actually-useful diagnostic.
+    dumpForDebug(html, ondemandJs, ondemandUrl, e.message);
+    if (ondemandJs && /KEY_BYTE/.test(e.message)) {
+      // Print the head of the bundle so a human can spot major shape
+      // changes from `docker logs` alone, no docker cp needed.
+      const head = ondemandJs.slice(0, 200).replace(/\s+/g, ' ');
+      logger.warn('txid', `ondemand.js head: ${head}…`);
+      logger.warn(
+        'txid',
+        'preprocessor did not match. If this persists, please share ' +
+        '/app/data/last-txid-fetch/ondemand.js — preprocessor needs an update',
+      );
+    }
     return false;
   }
 }

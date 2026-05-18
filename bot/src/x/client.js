@@ -216,7 +216,21 @@ export class XClient {
 
     const r = await this._request('GET', u.toString());
     if (r.status !== 200) {
-      const err = new Error(`SearchTimeline HTTP ${r.status}: ${(r.text || '').slice(0, 200)}`);
+      // Surface the queryId X rejected — the most common cause of 404 here
+      // is a stale captured-ops.json (X rotates queryId on every release).
+      // Without printing it, the user has no way to tell from the log
+      // whether it's a queryId rotation, an auth issue (would normally be
+      // 401/403 but X sometimes returns 404), or something else.
+      const queryId = capturedOp.queryId
+        || (u.pathname.match(/\/graphql\/([^/]+)\/SearchTimeline/) || [])[1]
+        || '<unknown>';
+      const body = (r.text || '').slice(0, 200);
+      const hint = r.status === 404
+        ? ' (likely stale queryId — re-capture from the browser extension)'
+        : '';
+      const err = new Error(
+        `SearchTimeline HTTP ${r.status}${hint}: queryId=${queryId} body=${body}`,
+      );
       err.status = r.status;
       throw err;
     }
