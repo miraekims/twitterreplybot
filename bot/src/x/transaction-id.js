@@ -25,10 +25,13 @@
 // indices") instead of our longer patched message confirmed this.
 //
 // Strategy now:
-//   1. Wrap the original constructor. Inside the wrapper we PRE-PROCESS the
-//      ondemand JS text to canonicalise tokens that the lib's regex can
-//      reliably match. This runs BEFORE the lib's constructor reads the
-//      text, so it doesn't matter where getIndices is defined.
+//   1. Subclass the original constructor (via `class extends`) and pre-
+//      process the ondemand JS text inside our subclass constructor before
+//      calling super(). This runs BEFORE the lib reads the text, so it
+//      doesn't matter where getIndices is defined inside the lib. We need
+//      `class extends` (not `function` + `.call`) because the lib ships
+//      ClientTransaction as a real ES6 class — `.call(this,...)` throws
+//      "Class constructor cannot be invoked without 'new'".
 //   2. Keep an exponential backoff on refreshes — when the bundle truly
 //      changes shape (algorithmic, not just identifier renames), nothing we
 //      do here recovers it; we MUST stop hammering the WAF every 5 seconds
@@ -105,15 +108,16 @@ async function loadLib() {
       logger.warn('txid', 'xclienttransaction loaded but ClientTransaction not found');
       return null;
     }
-    // Constructor wrapper: rewrite ondemand text before delegating. This
-    // works even if the lib defines getIndices as an instance arrow-fn
-    // because by then the constructor has already received our text.
-    WrappedCT = function PatchedClientTransaction(html, ondemandJs) {
-      const fixed = preprocessOndemand(ondemandJs);
-      Original.call(this, html, fixed);
+    // Constructor wrapper: rewrite ondemand text before delegating. We MUST
+    // use `class extends` (not `function` + `.call`) because the lib ships
+    // ClientTransaction as a real ES6 class — calling it without `new`
+    // throws "Class constructor cannot be invoked without 'new'", which is
+    // exactly what we hit on the first deploy of this fix.
+    WrappedCT = class PatchedClientTransaction extends Original {
+      constructor(html, ondemandJs) {
+        super(html, preprocessOndemand(ondemandJs));
+      }
     };
-    WrappedCT.prototype = Object.create(Original.prototype);
-    WrappedCT.prototype.constructor = WrappedCT;
     logger.info('txid', 'xclienttransaction loaded (ondemand preprocessor active)');
   } catch (e) {
     logger.warn('txid', `xclienttransaction not available (${e.message}) — using static fallback`);
