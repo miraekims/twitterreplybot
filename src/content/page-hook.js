@@ -107,4 +107,36 @@
   }
 
   send('hook-ready', { ts: Date.now() });
+
+  // ----------------------------------------------------------------------
+  // Relay-fetch: the content script (isolated world) cannot call the page's
+  // real fetch directly, and chrome.scripting.executeScript({world:'MAIN'})
+  // injects a fresh script context that x.com somehow detects and 404s.
+  // The fix: the bot driver in the SW asks the content script over
+  // chrome.runtime.sendMessage; the content script asks us via
+  // window.postMessage; we — running INSIDE the page's MAIN world, in the
+  // exact same global where x.com's own fetch wrapper lives — actually do
+  // the fetch. Then we postMessage the result back. The content script
+  // turns it back into the SW response.
+  //
+  // This is the path X.com cannot tell apart from its own fetches because
+  // it IS the same fetch the page uses, with the same wrappers x.com may
+  // have monkey-patched on it.
+  window.addEventListener('message', async (e) => {
+    if (e.source !== window) return;
+    const m = e.data;
+    if (!m || m.source !== 'xbot-content' || m.type !== 'fetch.req') return;
+    const { id, url, init } = m;
+    try {
+      const r = await fetch(url, init || {});
+      const body = await r.text();
+      const headers = {};
+      r.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+      window.postMessage({ source: 'xbot-page', type: 'fetch.res', id,
+        ok: r.ok, status: r.status, statusText: r.statusText, body, headers }, '*');
+    } catch (err) {
+      window.postMessage({ source: 'xbot-page', type: 'fetch.res', id,
+        error: String((err && err.message) || err) }, '*');
+    }
+  });
 })();

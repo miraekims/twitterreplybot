@@ -30,6 +30,23 @@ async function findXTab() {
 
 // Issue a fetch from the MAIN world of an x.com tab. Returns a tiny
 // Response-like object: { ok, status, statusText, headers.get(), text(), json() }.
+//
+// Why we don't just chrome.scripting.executeScript({world:'MAIN', func: fetch}):
+// X.com somehow detects that path and answers 404 with empty body even
+// though the same URL+headers from devtools console returns 200. Best
+// guess: each executeScript call creates a fresh JS context, and X
+// patches the page's `fetch` with a wrapper (e.g. to inject
+// x-client-transaction-id) that lives in the original page context.
+// A fresh injected script doesn't see that wrapper, so its fetch is
+// "raw" and X's WAF flags it.
+//
+// Workaround: route through page-hook.js. page-hook is a content_script
+// that runs in MAIN world at document_start, BEFORE the X bundle, and
+// inherits the same global as the X app code. We postMessage a
+// 'fetch.req' to it; it does the actual fetch (now using the same fetch
+// the X app patches) and postMessages back. The content script
+// (`src/content/index.js`) bridges the chrome.runtime.sendMessage <->
+// window.postMessage hop.
 async function xFetch(url, init = {}) {
   const tab = await findXTab();
   if (!tab) {
@@ -41,37 +58,26 @@ async function xFetch(url, init = {}) {
     throw err;
   }
 
-  let results;
+  let resp;
   try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: 'MAIN',
-      args: [url, init],
-      func: async (u, i) => {
-        try {
-          const r = await fetch(u, i);
-          const body = await r.text();
-          const headers = {};
-          r.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
-          return { ok: r.ok, status: r.status, statusText: r.statusText, body, headers };
-        } catch (e) {
-          return { error: String((e && e.message) || e) };
-        }
-      },
+    resp = await chrome.tabs.sendMessage(tab.id, {
+      type: 'relay.fetch',
+      payload: { url, init },
     });
   } catch (e) {
-    const err = new Error(`executeScript failed: ${e && e.message ? e.message : String(e)}`);
-    err.status = 0;
-    err.url = url;
-    throw err;
-  }
-
-  const result = results && results[0] && results[0].result;
-  if (!result) {
-    const err = new Error('executeScript returned no result (tab gone?)');
+    const err = new Error(
+      `relay sendMessage failed: ${e && e.message ? e.message : String(e)}` +
+      ' (content script not loaded? page might need a reload after extension update)'
+    );
     err.status = 0; err.url = url;
     throw err;
   }
+  if (!resp || !resp.ok) {
+    const err = new Error('relay response missing');
+    err.status = 0; err.url = url;
+    throw err;
+  }
+  const result = resp.data || {};
   if (result.error) {
     const err = new Error(`page fetch threw: ${result.error}`);
     err.status = 0; err.url = url;
