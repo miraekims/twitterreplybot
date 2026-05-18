@@ -20,11 +20,20 @@ RUN apt-get update \
 # the current platform, avoiding stale-lock skips of native dependencies.
 COPY package.json ./
 
-# Foreground scripts so we see the node-tls-client postinstall download.
-# Then assert the native binary is actually on disk — fail the build loud
-# if it isn't, instead of silently shipping a broken image.
-RUN npm install --foreground-scripts \
- && node -e "import('node-tls-client').then(m => { if (!m.Session && !(m.default && m.default.Session)) { throw new Error('node-tls-client loaded but Session export missing'); } console.log('node-tls-client OK, version', require('node-tls-client/package.json').version); })"
+# Foreground scripts so we see the install steps. Then run a tiny self-test
+# script that imports node-tls-client AND calls initTLS() — this forces koffi
+# to actually load the native library, which is the part that silently fails
+# when the library is missing or platform-incompatible.
+RUN npm install --foreground-scripts
+COPY <<'EOF' /tmp/tls-selftest.mjs
+import { Session, initTLS, destroyTLS } from 'node-tls-client';
+await initTLS();
+const s = new Session({ clientIdentifier: 'chrome_124', timeout: 5000 });
+await s.close();
+await destroyTLS();
+console.log('node-tls-client native library loaded OK');
+EOF
+RUN node /tmp/tls-selftest.mjs && rm /tmp/tls-selftest.mjs
 
 COPY src ./src
 

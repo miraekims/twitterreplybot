@@ -32,8 +32,12 @@ const PUBLIC_BEARER =
 const HOMEPAGE = 'https://x.com/home';
 const GQL_BASE = 'https://x.com/i/api/graphql';
 
-// Module-scoped: resolves once on first call. Subsequent constructors reuse.
+// Module-scoped: resolves once. v2 of node-tls-client requires an explicit
+// initTLS() call to load the native koffi-backed library before any Session
+// can be constructed; subsequent constructors reuse the same load.
 let TlsSession = null;
+let initTLSFn = null;
+let destroyTLSFn = null;
 let tlsTried = false;
 async function getTlsSession() {
   if (tlsTried) return TlsSession;
@@ -41,10 +45,22 @@ async function getTlsSession() {
   try {
     const mod = await import('node-tls-client');
     TlsSession = mod.Session || (mod.default && mod.default.Session);
-    if (TlsSession) {
-      logger.info('xclient', 'using node-tls-client (Chrome TLS fingerprint)');
-    } else {
+    initTLSFn = mod.initTLS || (mod.default && mod.default.initTLS);
+    destroyTLSFn = mod.destroyTLS || (mod.default && mod.default.destroyTLS);
+    if (!TlsSession) {
       logger.warn('xclient', 'node-tls-client present but Session export missing; using vanilla fetch');
+      TlsSession = null;
+      return null;
+    }
+    if (initTLSFn) {
+      await initTLSFn();
+    }
+    logger.info('xclient', 'using node-tls-client (Chrome TLS fingerprint)');
+    // On graceful shutdown, release the native library.
+    if (destroyTLSFn) {
+      const cleanup = () => { try { destroyTLSFn(); } catch (_) {} };
+      process.once('SIGINT', cleanup);
+      process.once('SIGTERM', cleanup);
     }
   } catch (e) {
     logger.warn(
