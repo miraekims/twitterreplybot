@@ -11,6 +11,9 @@
 //
 // This eliminates the need to manually copy x-client-transaction-id from
 // Chrome DevTools every few hours.
+//
+// IMPORTANT: X returns empty HTML to unauthenticated requests. We MUST pass
+// valid cookies when fetching x.com/home, otherwise we get nothing back.
 import { spawn } from 'node:child_process';
 import { logger } from '../core/logger.js';
 import { getCapturedTransactionId } from './captured-ops.js';
@@ -22,6 +25,9 @@ let cachedCt = null;       // ClientTransaction instance
 let cacheCreatedAt = 0;
 let ClientTransaction = null;
 let initAttempted = false;
+
+// Stored cookies for authenticated fetches (set by first caller)
+let _cookies = null;
 
 async function loadLib() {
   if (initAttempted) return ClientTransaction;
@@ -41,11 +47,12 @@ async function loadLib() {
   return ClientTransaction;
 }
 
-// Fetch a URL using curl_chrome116 (same binary the bot uses for X API calls).
-// Returns the response body as a string.
-function curlGet(url) {
+// Fetch a URL using curl_chrome116 WITH cookies (X returns empty without them).
+function curlGet(url, cookieHeader = null) {
   return new Promise((resolve, reject) => {
-    const args = ['-sS', '--max-time', '15', '-L', url];
+    const args = ['-sS', '--max-time', '15', '-L'];
+    if (cookieHeader) args.push('-H', `cookie: ${cookieHeader}`);
+    args.push(url);
     const child = spawn(CURL_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
@@ -59,32 +66,37 @@ function curlGet(url) {
   });
 }
 
-// Find the ondemand.js URL from X's HTML. X embeds it as a <link> or <script>
-// with a path like /ondemand.s.<hash>.js or similar pattern.
+// Find the ondemand.js URL from X's HTML. X embeds it in various forms:
+//   - <script src="https://abs.twimg.com/responsive-web/client-web/ondemand.s.XXXX.js">
+//   - <link rel="preload" href="/responsive-web/client-web/ondemand.s.XXXX.js">
+//   - inline references in script tags
 function findOndemandUrl(html) {
-  // Pattern 1: script src containing "ondemand"
-  const m1 = html.match(/src="(https?:\/\/[^"]*ondemand[^"]*\.js)"/i);
+  // Pattern 1: any URL containing "ondemand" and ending in .js
+  const m1 = html.match(/(https?:\/\/[^"'\s]*ondemand[^"'\s]*\.js)/i);
   if (m1) return m1[1];
-  // Pattern 2: relative path
-  const m2 = html.match(/src="(\/[^"]*ondemand[^"]*\.js)"/i);
-  if (m2) return 'https://x.com' + m2[1];
-  // Pattern 3: in link rel=preload
-  const m3 = html.match(/href="(https?:\/\/[^"]*ondemand[^"]*\.js)"/i);
+  // Pattern 2: relative path with ondemand
+  const m2 = html.match(/(\/[^"'\s]*ondemand[^"'\s]*\.js)/i);
+  if (m2) return 'https://abs.twimg.com' + m2[1];
+  // Pattern 3: look for any abs.twimg.com JS that might contain the indices
+  // (fallback — X sometimes renames ondemand to something else)
+  const m3 = html.match(/(https?:\/\/abs\.twimg\.com\/responsive-web\/client-web\/[^"'\s]*\.js)/i);
   if (m3) return m3[1];
-  const m4 = html.match(/href="(\/[^"]*ondemand[^"]*\.js)"/i);
-  if (m4) return 'https://x.com' + m4[1];
   return null;
 }
 
 async function refreshCache() {
   const CT = await loadLib();
   if (!CT) return false;
+  if (!_cookies) {
+    logger.warn('txid', 'no cookies available for authenticated fetch — cannot refresh');
+    return false;
+  }
 
   try {
-    // 1. Fetch x.com home HTML
-    const html = await curlGet('https://x.com');
+    // 1. Fetch x.com home HTML WITH cookies (X returns empty without auth)
+    const html = await curlGet('https://x.com/home', _cookies);
     if (!html || html.length < 1000) {
-      logger.warn('txid', 'x.com HTML too short, skipping refresh');
+      logger.warn('txid', `x.com HTML too short (${html?.length || 0} bytes), skipping refresh`);
       return false;
     }
 
@@ -95,7 +107,7 @@ async function refreshCache() {
       return false;
     }
 
-    const ondemandJs = await curlGet(ondemandUrl);
+    const ondemandJs = await curlGet(ondemandUrl, _cookies);
     if (!ondemandJs || ondemandJs.length < 100) {
       logger.warn('txid', `ondemand.js too short (${ondemandJs?.length || 0} bytes)`);
       return false;
@@ -114,7 +126,11 @@ async function refreshCache() {
 
 // Generate a fresh transaction-id for the given method + path.
 // Falls back to static value from captured-ops.json if generation fails.
-export async function generateTransactionId(method, path) {
+// `cookies` param: "auth_token=XXX; ct0=XXX" — needed for authenticated fetch.
+export async function generateTransactionId(method, path, cookies = null) {
+  // Store cookies for future cache refreshes
+  if (cookies) _cookies = cookies;
+
   // Refresh cache if stale or missing
   if (!cachedCt || (Date.now() - cacheCreatedAt > CACHE_TTL_MS)) {
     await refreshCache();

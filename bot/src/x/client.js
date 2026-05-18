@@ -149,7 +149,8 @@ export class XClient {
     // Generate fresh transaction-id for this specific request
     let urlPath;
     try { urlPath = new URL(url).pathname; } catch { urlPath = url; }
-    const txId = await generateTransactionId(method, urlPath);
+    const cookieStr = `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`;
+    const txId = await generateTransactionId(method, urlPath, cookieStr);
 
     const headers = chromeHeaderArgs({
       ct0: this.secrets.ct0, lang: this.lang, isPost,
