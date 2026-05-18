@@ -5,6 +5,13 @@
 // `queryId` or `features` — they're harvested from live traffic and persist
 // across X frontend releases.
 //
+// Transport: requests are NOT issued from the service worker. From a SW
+// `fetch()` carries `Origin: chrome-extension://...` and `Sec-Fetch-Site:
+// cross-site`, which X.com responds to with HTTP 404 (an application-layer
+// anti-bot rule). Instead we run the fetch via `chrome.scripting.executeScript`
+// in the page MAIN world of an open x.com tab — that fetch is indistinguishable
+// from a request made by X's own code (Origin: https://x.com, same-origin).
+//
 // Subtle bit: when we replay the captured `variables`, we strip pagination
 // fields (`cursor`, `referrer`, ...). Otherwise the live X client may have
 // last issued e.g. SearchTimeline with a cursor, and reusing that cursor
@@ -12,6 +19,74 @@
 import { getOp, getHeaders } from './query-registry.js';
 
 const GQL_BASE = 'https://x.com/i/api/graphql';
+
+// ---------- Page-world transport ----------
+
+async function findXTab() {
+  const tabs = await chrome.tabs.query({ url: ['*://x.com/*', '*://twitter.com/*'] });
+  if (!tabs.length) return null;
+  return tabs.find((t) => t.active) || tabs[0];
+}
+
+// Issue a fetch from the MAIN world of an x.com tab. Returns a tiny
+// Response-like object: { ok, status, statusText, headers.get(), text(), json() }.
+async function xFetch(url, init = {}) {
+  const tab = await findXTab();
+  if (!tab) {
+    const err = new Error(
+      'No x.com tab is open. Keep at least one x.com tab logged in while the bot runs.'
+    );
+    err.status = 0;
+    err.url = url;
+    throw err;
+  }
+
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      args: [url, init],
+      func: async (u, i) => {
+        try {
+          const r = await fetch(u, i);
+          const body = await r.text();
+          const headers = {};
+          r.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+          return { ok: r.ok, status: r.status, statusText: r.statusText, body, headers };
+        } catch (e) {
+          return { error: String((e && e.message) || e) };
+        }
+      },
+    });
+  } catch (e) {
+    const err = new Error(`executeScript failed: ${e && e.message ? e.message : String(e)}`);
+    err.status = 0;
+    err.url = url;
+    throw err;
+  }
+
+  const result = results && results[0] && results[0].result;
+  if (!result) {
+    const err = new Error('executeScript returned no result (tab gone?)');
+    err.status = 0; err.url = url;
+    throw err;
+  }
+  if (result.error) {
+    const err = new Error(`page fetch threw: ${result.error}`);
+    err.status = 0; err.url = url;
+    throw err;
+  }
+
+  return {
+    ok: result.ok,
+    status: result.status,
+    statusText: result.statusText || '',
+    headers: { get: (k) => result.headers[String(k).toLowerCase()] || null },
+    text: async () => result.body,
+    json: async () => JSON.parse(result.body),
+  };
+}
 
 // Variables we never want to inherit from a captured request — they're either
 // pagination state or session-specific noise.
@@ -93,12 +168,12 @@ async function gqlGet(opName, variables) {
   const url = buildGetUrl(op, opName, variables);
   const headers = await buildHeaders();
 
-  const resp = await fetch(url.toString(), {
+  const resp = await xFetch(url.toString(), {
     method: 'GET',
     credentials: 'include',
     headers,
-    referrer: 'https://x.com/',
-    referrerPolicy: 'strict-origin-when-cross-origin',
+    // referrer/referrerPolicy intentionally omitted: when xFetch runs in the
+    // page MAIN world, the browser fills these correctly from x.com itself.
   });
   if (!resp.ok) {
     const t = await resp.text().catch(() => '');
@@ -167,20 +242,16 @@ export async function createTweet({ text, replyToTweetId }) {
     queryId: op.queryId,
   };
 
-  // Same logic as for GETs: use the captured POST URL when available, so
-  // we always hit the exact path/host X used.
-  const url = op.url
-    ? op.url
-    : `${GQL_BASE}/${op.queryId}/CreateTweet`;
+  // Use the captured POST URL when available, so we always hit the exact
+  // path/host X used.
+  const url = op.url ? op.url : `${GQL_BASE}/${op.queryId}/CreateTweet`;
   const headers = await buildHeaders({ 'content-type': 'application/json' });
 
-  const resp = await fetch(url, {
+  const resp = await xFetch(url, {
     method: 'POST',
     credentials: 'include',
     headers,
     body: JSON.stringify(body),
-    referrer: 'https://x.com/',
-    referrerPolicy: 'strict-origin-when-cross-origin',
   });
   if (!resp.ok) {
     const t = await resp.text().catch(() => '');
