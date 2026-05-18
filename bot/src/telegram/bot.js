@@ -16,7 +16,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { db } from '../core/db.js';
 import { encryptJSON } from '../core/crypto.js';
 import { logger } from '../core/logger.js';
-import { defaultCampaignConfig } from '../campaign/defaults.js';
+import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS } from '../campaign/defaults.js';
 
 const PASSPHRASE = process.env.ENCRYPTION_PASSPHRASE;
 
@@ -45,6 +45,7 @@ export function startTelegram() {
   bot.onText(/^\/stop\s+(\d+)/, (m, mt) => guard(m, () => cmdSetStatus(m, +mt[1], 'idle')));
   bot.onText(/^\/stats\s+(\d+)/, (m, mt) => guard(m, () => cmdStats(m, +mt[1])));
   bot.onText(/^\/logs\s+(\d+)/, (m, mt) => guard(m, () => cmdLogs(m, +mt[1])));
+  bot.onText(/^\/preset(?:\s+(\d+)\s+(\w+))?/, (m, mt) => guard(m, () => cmdPreset(m, mt[1] && +mt[1], mt[2])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
 
   logger.info('tg', 'telegram bot started (long-poll)');
@@ -67,6 +68,7 @@ const HELP = [
   '/campaigns — list campaigns',
   '/run <id>, /pause <id>, /stop <id>',
   '/stats <id>, /logs <id>',
+  '/preset <id> <safe|medium|highvolume> — swap pacing profile',
   '/disconnect <account_id>',
 ].join('\n');
 
@@ -129,11 +131,51 @@ function cmdStats(msg, id) {
   const c = db.getCampaign(id);
   if (!c) return bot.sendMessage(msg.chat.id, 'No such campaign.');
   const lastHour = db.countSentLastHour(id);
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch { cfg = {}; }
+  const dailyEst = expectedDailyReplies(cfg);
+  const cap = cfg?.pacing?.maxRepliesPerHour ?? '?';
   bot.sendMessage(msg.chat.id,
     `#${id} "${c.name}" — ${c.status}\n` +
     `Sent total: ${c.sent_total}, last hour: ${lastHour}\n` +
+    `Cap: ${cap}/h (~${dailyEst}/day with current sleep window)\n` +
     `Last action: ${c.last_action_at ? new Date(c.last_action_at).toISOString() : 'never'}\n` +
     (c.last_error ? `⚠ ${c.last_error}` : ''));
+}
+
+function cmdPreset(msg, id, name) {
+  if (!id || !name) {
+    const lines = Object.entries(PRESETS).map(([k, v]) =>
+      `  ${k}: ${v.maxRepliesPerHour}/h, delay ${v.minDelaySec}-${v.maxDelaySec}s`,
+    );
+    return bot.sendMessage(msg.chat.id,
+      'Usage: /preset <campaign_id> <safe|medium|highvolume>\n\n' +
+      'Available presets:\n' + lines.join('\n') + '\n\n' +
+      '⚠ highvolume targets ~1000/day. Only use on aged accounts behind a ' +
+      'residential proxy with a real persona — sustained 60+/h on a cold ' +
+      'account will trip X\'s spam heuristics fast.');
+  }
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(msg.chat.id, 'No such campaign.');
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    return bot.sendMessage(msg.chat.id, `corrupt config_json: ${e.message}`);
+  }
+  let pacing;
+  try { pacing = presetPacing(name); }
+  catch (e) { return bot.sendMessage(msg.chat.id, e.message); }
+  cfg.pacing = pacing;
+  db.setCampaignConfig(id, JSON.stringify(cfg));
+  const daily = expectedDailyReplies(cfg);
+  let warn = '';
+  if (name === 'highvolume') {
+    warn = '\n\n⚠ highvolume preset applied. Watch /logs for 401/403/429 ' +
+           'and stop immediately if any appear.';
+  }
+  bot.sendMessage(msg.chat.id,
+    `✓ campaign #${id} → preset "${name}"\n` +
+    `Cap: ${pacing.maxRepliesPerHour}/h, delay ${pacing.minDelaySec}-${pacing.maxDelaySec}s\n` +
+    `Estimated: ~${daily} replies/day with current sleep window` + warn);
 }
 
 function cmdLogs(msg, id) {
