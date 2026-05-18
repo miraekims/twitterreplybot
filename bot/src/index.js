@@ -1,19 +1,23 @@
 // X Reply Bot — standalone Node.js entry point.
 //
-// Architecture (matching the prior project's docs):
-//   Telegram bot (long-poll)  ←→  this process  ←→  X.com (HTTPS via tls-client)
-//                                    │
-//                                    └→ SQLite (Fernet-encrypted cookies/proxies)
+// Architecture (post-bridge refactor):
+//   Telegram (long-poll)  ←→  this process  ←→  Chrome extension (WebSocket)
+//                                  │                       │
+//                                  │                       └→ x.com / api.x.com
+//                                  └→ SQLite (campaigns, logs)
 //
-// One Node process supervises N "campaigns" (one per X account). Each campaign
-// has its own loop, queue, rate limit and persona. Crashes are isolated per
-// campaign — a dead worker doesn't take the bot down.
+// The bot no longer talks to x.com directly. The Chrome extension owns
+// session state (cookies, queryId, x-client-transaction-id, TLS fingerprint)
+// and receives RPC commands from us over a localhost WebSocket. See
+// src/bridge/server.js for the wire protocol and src/x/client.js for the
+// thin RPC adapter that runner.js uses.
 import 'dotenv/config';
 import { startTelegram } from './telegram/bot.js';
 import { db } from './core/db.js';
 import { startSupervisor } from './core/supervisor.js';
 import { logger } from './core/logger.js';
 import { aiActivationSummary } from './persona/persona.js';
+import { startBridgeServer, bridge } from './bridge/server.js';
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -27,22 +31,32 @@ function requireEnv(name) {
 async function main() {
   requireEnv('TELEGRAM_BOT_TOKEN');
   requireEnv('TELEGRAM_ALLOWED_USERS');
-  requireEnv('ENCRYPTION_PASSPHRASE');
+  // ENCRYPTION_PASSPHRASE used to encrypt cookies in DB. Cookies live in
+  // Chrome now, so this env is no longer required for new installs. We
+  // still read it if present to keep old DB rows decryptable, but don't
+  // hard-fail if missing.
+  if (!process.env.ENCRYPTION_PASSPHRASE) {
+    logger.info('boot', 'ENCRYPTION_PASSPHRASE not set (ok — cookies are owned by Chrome now)');
+  }
+  const bridgeToken = requireEnv('XBOT_BRIDGE_TOKEN');
+  const bridgePort = parseInt(process.env.XBOT_BRIDGE_PORT || '8787', 10);
 
   await db.init();
   logger.info('boot', `db ready at ${db.path}`);
-
-  // Surface persona AI status at boot so misconfig is visible immediately,
-  // not 10 minutes later when the first reply gets rendered as raw template.
   logger.info('boot', `persona AI: ${aiActivationSummary()}`);
 
-  // Start campaign supervisor — wakes up every 5s, runs ticks for active campaigns.
-  startSupervisor();
+  startBridgeServer({ port: bridgePort, token: bridgeToken });
 
-  // Start Telegram bot (long-poll).
+  // Surface bridge transitions in the main log so docker logs --tail makes
+  // it easy to see when Chrome dies / wakes up. Telegram /stats and
+  // runner.js already react in their own way.
+  bridge.onConnect((s) => logger.info('boot', `bridge: ✓ extension connected as @${s.handle || '?'}`));
+  bridge.onDisconnect((s) => logger.warn('boot', `bridge: ✗ extension disconnected (was @${s.handle || '?'})`));
+
+  startSupervisor();
   startTelegram();
 
-  process.on('SIGINT', async () => {
+  process.on('SIGINT', () => {
     logger.info('boot', 'SIGINT — shutting down');
     process.exit(0);
   });

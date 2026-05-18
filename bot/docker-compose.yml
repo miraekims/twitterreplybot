@@ -1,10 +1,15 @@
 # Single-service compose. One command brings up the bot:
 #   docker compose up -d --build
 #
-# The container reads /app/.env (mounted from the host's bot/.env) and writes
-# its SQLite DB to /app/data (mounted from bot/data on host). Both files are
-# the same ones the host-Node version uses, so you can switch back and forth
-# without losing accounts or campaigns.
+# The container reads /app/.env (mounted from bot/.env) and writes its
+# SQLite DB to /app/data (mounted from bot/data on host).
+#
+# Network: we publish the bridge port to 127.0.0.1 ONLY. The Chrome
+# extension running on the host reaches it via host.docker.internal:8787
+# (Docker Desktop's built-in DNS for the host gateway). We deliberately
+# DON'T bind to 0.0.0.0 on the host — that would expose the bridge to
+# anyone on the LAN, and the shared token alone isn't enough for that
+# threat model.
 services:
   bot:
     build: .
@@ -13,5 +18,5 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-    # No published ports — bot only does outbound HTTPS to x.com and
-    # api.telegram.org. Anything else suggests something's wrong.
+    ports:
+      - "127.0.0.1:8787:8787"

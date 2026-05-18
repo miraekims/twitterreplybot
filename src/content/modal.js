@@ -329,6 +329,31 @@ const XBotModal = (() => {
           : 'All required ops captured. You can press Start in the Auto-reply tab.'),
     ));
 
+    // Bot bridge status — we want to see at a glance whether the Docker
+    // bot can drive us. Polled in refreshAll so it self-updates while open.
+    const bridgeBox = el('div', { class: 'xbot-card', style: 'margin-top:8px' },
+      el('div', { class: 'xbot-meta' }, el('strong', {}, 'Bot bridge')),
+      el('div', { class: 'xbot-text' }, 'loading...'),
+      el('div', { class: 'xbot-row' },
+        el('button', { class: 'xbot-btn secondary', onclick: () => chrome.runtime.openOptionsPage() }, 'Configure URL & token'),
+      ),
+    );
+    pane.appendChild(bridgeBox);
+    send('bridge.getStatus', {}).then((r) => {
+      const text = bridgeBox.querySelector('.xbot-text');
+      if (!r.ok || !r.data) { text.textContent = 'unknown'; return; }
+      const s = r.data;
+      if (s.connected) {
+        text.textContent = `✓ Connected as @${s.handle || '?'} (ext v${s.extVersion || '?'}).` +
+          ` The Docker bot can issue search/reply RPCs.`;
+      } else if (s.connecting) {
+        text.textContent = '… connecting';
+      } else {
+        text.textContent = '✗ Disconnected' + (s.lastError ? ` — ${s.lastError}` : '') +
+          '. Open Options (button below) to set bridge URL + shared token.';
+      }
+    });
+
     // Diagnostics: run a single search and dump everything we know.
     const diagInput = el('input', { class: 'xbot-input', placeholder: 'Test query', value: 'crypto' });
     const diagBtn = el('button', { class: 'xbot-btn' }, 'Test search');

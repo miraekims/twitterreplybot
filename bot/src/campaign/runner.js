@@ -2,32 +2,36 @@
 // running campaign. At most one X.com action per tick.
 //
 // Decision tree:
-//   1. sleep window? → bail
-//   2. hourly cap reached? → bail
-//   3. cooldown since last action not elapsed? → bail
-//   4. queue empty + searchEverySec elapsed? → search, refill queue
-//   5. queue has items? → reply to next tweet, dedup-mark
+//   1. extension bridge disconnected? → idle (don't burn cooldown)
+//   2. sleep window? → bail
+//   3. hourly cap reached? → bail
+//   4. cooldown since last action not elapsed? → bail
+//   5. queue empty + searchEverySec elapsed? → search, refill queue
+//   6. queue has items? → reply to next tweet, dedup-mark
 //
 // Throughput notes (re: 1000-replies/day target):
 //   - The supervisor wakes every 5s, so the actual-vs-configured cooldown
 //     has up to ~2.5s slop per reply. At 1000/day that's ~42min/day of
 //     unrecoverable slop, baked into the math in defaults.js.
 //   - Cooldown is rolled ONCE per reply (stored in `nextEligibleAt`), not
-//     re-rolled on every tick. The previous version re-rolled per tick,
-//     which made the gate non-monotonic and reduced effective throughput
-//     because long rolls early in the window kept resetting the wait.
-//   - When the queue is empty, we search immediately if the last search
-//     was productive. Only when consecutive searches return empty do we
-//     fall back to the configured `searchEverySec` throttle. That avoids
-//     idling for 2 minutes with bandwidth still on the table.
+//     re-rolled on every tick. Re-rolling per-tick was non-monotonic and
+//     dropped effective throughput.
+//   - When the queue is empty, we search immediately if the last search was
+//     productive. Only when consecutive searches return empty do we fall
+//     back to the configured `searchEverySec` throttle.
+//
+// Bridge note: with the Chrome-bridge architecture, `account_id` no longer
+// uniquely identifies a session — the extension is global per Chrome
+// install, and the connected handle is whichever account is logged into
+// x.com in that Chrome. We still keep account_id on campaigns for now, but
+// every campaign effectively shares the same upstream session. Multi-
+// account support would need either multiple Chrome profiles or per-handle
+// routing through the bridge; explicit non-goal at v0.1.
 import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
-import { decryptJSON } from '../core/crypto.js';
 import { XClient } from '../x/client.js';
-import { capturedOps } from '../x/captured-ops.js';
+import { bridge } from '../bridge/server.js';
 import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
-
-const PASSPHRASE = process.env.ENCRYPTION_PASSPHRASE;
 
 // Per-campaign in-memory state. Rebuilt fresh on process restart — the only
 // thing we lose is "next eligible at", which means a freshly-restarted bot
@@ -37,11 +41,22 @@ const queues = new Map();              // campaign_id → tweet[]
 const nextEligibleAt = new Map();      // campaign_id → timestamp ms
 const lastSearchEmpty = new Map();     // campaign_id → boolean (true = throttle)
 const sleepLogTickedAt = new Map();    // campaign_id → timestamp ms (rate-limit sleep msgs)
+const bridgeWarnedAt = new Map();      // campaign_id → ts (last "bridge offline" warn)
 
 export async function tickCampaign(campaign) {
   const cfg = JSON.parse(campaign.config_json);
-  const acct = db.getAccount(campaign.account_id);
-  if (!acct) { db.setCampaignStatus(campaign.id, 'error', 'account missing'); return; }
+
+  // Bridge offline? Idle silently — don't roll cooldowns, don't burn
+  // hourly bucket, don't call client. Logging is rate-limited so we don't
+  // spam every 5s when Chrome is closed.
+  if (!bridge.isConnected()) {
+    const last = bridgeWarnedAt.get(campaign.id) || 0;
+    if (Date.now() - last > 5 * 60_000) {
+      logger.warn('runner', `c${campaign.id} idle: extension bridge not connected`, campaign.id);
+      bridgeWarnedAt.set(campaign.id, Date.now());
+    }
+    return;
+  }
 
   // Sleep window?
   const sleepRemain = inSleepWindow(cfg.sleep);
@@ -61,28 +76,15 @@ export async function tickCampaign(campaign) {
   }
 
   // Cooldown since last action? Use the eligibility timestamp set after the
-  // PREVIOUS reply. If nothing scheduled (process just started, or never
-  // replied), we're eligible now.
+  // PREVIOUS reply. If nothing scheduled, we're eligible now.
   const eligibleAt = nextEligibleAt.get(campaign.id) || 0;
   if (Date.now() < eligibleAt) return;
 
-  let client;
-  try {
-    const secrets = decryptJSON(PASSPHRASE, acct.secrets_blob);
-    client = new XClient({ secrets, proxy: acct.proxy || null, lang: cfg.lang || 'en' });
-  } catch (e) {
-    db.setCampaignStatus(campaign.id, 'error', `decrypt failed: ${e.message}`);
-    logger.error('runner', `c${campaign.id} decrypt: ${e.message}`, campaign.id);
-    return;
-  }
+  const client = new XClient({ lang: cfg.lang || 'en' });
 
   // Search if queue empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
-    // Throttle search ONLY if the previous search came back empty. If the
-    // last search produced tweets, the queue draining means we found
-    // engagement and should refill immediately. That's the difference
-    // between 1000/day and ~600/day.
     if (lastSearchEmpty.get(campaign.id)) {
       const sinceSearch = Date.now() - (campaign.last_search_at || 0);
       if (campaign.last_search_at && sinceSearch < (cfg.pacing.searchEverySec || 180) * 1000) return;
@@ -95,6 +97,11 @@ export async function tickCampaign(campaign) {
       logger.info('runner', `c${campaign.id} search → ${queue.length} usable`, campaign.id);
     } catch (e) {
       logger.error('runner', `c${campaign.id} search: ${e.message}`, campaign.id);
+      // BRIDGE_DISCONNECTED means Chrome went away mid-call. Don't escalate
+      // to error status — we'll just retry on the next tick when bridge is
+      // back. Auth/rate-limit codes from x.com still hard-stop the
+      // campaign so we don't spam into a wall.
+      if (e.code === 'BRIDGE_DISCONNECTED') return;
       if (e.status === 401 || e.status === 403 || e.status === 429) {
         db.setCampaignStatus(campaign.id, 'error', e.message);
       }
@@ -117,26 +124,17 @@ export async function tickCampaign(campaign) {
       persona: cfg.persona,
     });
   } catch (e) {
-    // AI configured but failed (timeout, rate-limit, etc). Fall back to
-    // literal substitution rather than skip — half a reply is better than
-    // none for a campaign at scale, and the next reply will retry the API.
     text = literalSubstitute(tpl, t);
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
 
-  // Schedule next-eligible BEFORE the network call. If the call hangs we
-  // still won't fire again immediately on the next tick. Roll the cooldown
-  // here so it's stable across ticks (vs. re-rolling and getting lucky/
-  // unlucky on each one).
+  // Schedule next-eligible BEFORE the network call so a hung call doesn't
+  // queue a duplicate on the next tick.
   const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
   nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
 
   try {
-    await client.createTweet({
-      capturedOp: capturedOps.CreateTweet,
-      text,
-      replyToTweetId: t.id,
-    });
+    await client.createTweet({ text, replyToTweetId: t.id });
     db.markSent(campaign.id, t.id);
     db.bumpCampaignAction(campaign.id, 'reply');
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
@@ -144,6 +142,13 @@ export async function tickCampaign(campaign) {
   } catch (e) {
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     logger.error('runner', `c${campaign.id} reply ${t.id} (${who}): ${e.message}`, campaign.id);
+    if (e.code === 'BRIDGE_DISCONNECTED') {
+      // Don't mark sent — extension never sent the reply. Push the tweet
+      // back to the front so the next tick (with bridge restored) tries it.
+      queue.unshift(t);
+      queues.set(campaign.id, queue);
+      return;
+    }
     db.markSent(campaign.id, t.id); // don't retry the same broken tweet
     if (e.status === 401 || e.status === 403 || e.status === 429) {
       db.setCampaignStatus(campaign.id, 'error', e.message);
@@ -152,21 +157,18 @@ export async function tickCampaign(campaign) {
 }
 
 async function runSearchPhase(client, campaign, cfg) {
-  if (!capturedOps.SearchTimeline) {
-    throw new Error('SearchTimeline shape not captured. See bot/src/x/captured-ops.js');
-  }
   const all = [];
   const seen = new Set();
   for (const kw of cfg.keywords) {
     try {
-      const { tweets } = await client.searchTimeline({
-        capturedOp: capturedOps.SearchTimeline,
-        query: kw,
-      });
+      const { tweets } = await client.searchTimeline({ query: kw });
       for (const t of tweets) {
         if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _kw: kw }); }
       }
     } catch (e) {
+      // Hard errors (bridge down, auth, rate limit) bubble up so the
+      // caller can break the loop and decide what to do.
+      if (e.code === 'BRIDGE_DISCONNECTED') throw e;
       if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
       logger.warn('runner', `c${campaign.id} search "${kw}": ${e.message}`, campaign.id);
     }
@@ -175,9 +177,7 @@ async function runSearchPhase(client, campaign, cfg) {
 
   // Filter — track drops for diagnostics. If a non-trivial fraction of
   // tweets is dropped solely for missing authorHandle, that's our canary
-  // for X having silently changed the user-result shape again. See
-  // x/client.js extractTweets() for the resolution logic. Without this
-  // count the symptom would just be "search → 0 usable" on every cycle.
+  // for X having silently changed the user-result shape again.
   let droppedNoHandle = 0;
   const passed = [];
   for (const t of all) {
@@ -189,9 +189,6 @@ async function runSearchPhase(client, campaign, cfg) {
   }
   if (droppedNoHandle > 0 && all.length > 0) {
     const pct = Math.round((droppedNoHandle / all.length) * 100);
-    // Above ~30% suggests a shape change rather than a long-tail of
-    // protected/anonymous accounts. Surface as WARN so it shows up in
-    // /logs and `docker logs --tail` without grepping.
     const fn = pct > 30 ? 'warn' : 'info';
     logger[fn](
       'runner',
@@ -204,10 +201,6 @@ async function runSearchPhase(client, campaign, cfg) {
 
 function passesFilters(t, f) {
   if (!t || !t.id || !t.text) return false;
-  // Drop tweets where we couldn't resolve the author. With no handle the
-  // template can't render `@{author}` and the log line becomes "@null …",
-  // which is what was happening before extractTweets handled the new
-  // result.core.screen_name shape. Cheap belt-and-suspenders.
   if (!t.authorHandle) return false;
   if (f.skipReplies && t.isReply) return false;
   if (f.skipRetweets && t.isRetweet) return false;
