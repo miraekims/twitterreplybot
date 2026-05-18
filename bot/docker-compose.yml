@@ -1,0 +1,17 @@
+# Single-service compose. One command brings up the bot:
+#   docker compose up -d --build
+#
+# The container reads /app/.env (mounted from the host's bot/.env) and writes
+# its SQLite DB to /app/data (mounted from bot/data on host). Both files are
+# the same ones the host-Node version uses, so you can switch back and forth
+# without losing accounts or campaigns.
+services:
+  bot:
+    build: .
+    container_name: x-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    # No published ports — bot only does outbound HTTPS to x.com and
+    # api.telegram.org. Anything else suggests something's wrong.
