@@ -11,7 +11,7 @@ import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
 import { decryptJSON } from '../core/crypto.js';
 import { XClient } from '../x/client.js';
-import { capturedOps, getCapturedTransactionId } from '../x/captured-ops.js';
+import { capturedOps } from '../x/captured-ops.js';
 import { rewriteTemplate } from '../persona/persona.js';
 
 const PASSPHRASE = process.env.ENCRYPTION_PASSPHRASE;
@@ -50,7 +50,7 @@ export async function tickCampaign(campaign) {
   let client;
   try {
     const secrets = decryptJSON(PASSPHRASE, acct.secrets_blob);
-    client = new XClient({ secrets, proxy: acct.proxy || null, lang: cfg.lang || 'en', transactionId: getCapturedTransactionId() });
+    client = new XClient({ secrets, proxy: acct.proxy || null, lang: cfg.lang || 'en' });
   } catch (e) {
     db.setCampaignStatus(campaign.id, 'error', `decrypt failed: ${e.message}`);
     logger.error('runner', `c${campaign.id} decrypt: ${e.message}`, campaign.id);

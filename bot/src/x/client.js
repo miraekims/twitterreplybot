@@ -16,6 +16,7 @@
 // We do at most one call per tick (5 seconds), so it's irrelevant.
 import { spawn } from 'node:child_process';
 import { logger } from '../core/logger.js';
+import { generateTransactionId } from './transaction-id.js';
 
 const PUBLIC_BEARER =
   'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D' +
@@ -134,35 +135,43 @@ function runCurl({ method, url, headers, cookieHeader, body, proxy }) {
 }
 
 export class XClient {
-  constructor({ secrets, proxy = null, lang = 'en', transactionId = null }) {
+  constructor({ secrets, proxy = null, lang = 'en' }) {
     this.secrets = secrets;
     this.proxy = proxy;
     this.lang = lang;
-    this.transactionId = transactionId;
   }
 
   async _request(method, url, { body = null } = {}) {
     const ok = await probeCurl();
     const isPost = body !== null;
     const cookieHeader = `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`;
+
+    // Generate fresh transaction-id for this specific request
+    let urlPath;
+    try { urlPath = new URL(url).pathname; } catch { urlPath = url; }
+    const txId = await generateTransactionId(method, urlPath);
+
     const headers = chromeHeaderArgs({
       ct0: this.secrets.ct0, lang: this.lang, isPost,
-      transactionId: this.transactionId,
+      transactionId: txId,
     });
 
     if (ok) {
       const bodyStr = isPost ? JSON.stringify(body) : null;
-      return runCurl({
+      const result = await runCurl({
         method, url, headers, cookieHeader,
         body: bodyStr, proxy: this.proxy,
       });
+      // Auto-refresh ct0 if X sends a new one in the response
+      // (curl-impersonate doesn't expose set-cookie easily, so we
+      // rely on the response body for now — ct0 refresh will be
+      // handled via a periodic /home hit in a future iteration)
+      return result;
     }
 
-    // Fallback: vanilla Node fetch. Likely 404 on X.com but keeps Telegram
-    // control alive so the user can /stop, /stats, /logs.
+    // Fallback: vanilla Node fetch.
     const obj = {};
     for (let i = 0; i < headers.length; i += 2) {
-      // headers is ['-H','k: v','-H','k: v',...]; parse back.
       const kv = headers[i + 1];
       const idx = kv.indexOf(': ');
       if (idx > 0) obj[kv.slice(0, idx)] = kv.slice(idx + 2);
@@ -264,7 +273,16 @@ function extractTweets(data) {
     const id = node.rest_id;
     if (tw && id && typeof tw.full_text === 'string' && !seen.has(id)) {
       seen.add(id);
-      const u = node.core?.user_results?.result;
+      // User data can be nested in several places depending on the response shape
+      const u =
+        node.core?.user_results?.result?.legacy ||
+        node.core?.user_results?.result ||
+        node.tweet?.core?.user_results?.result?.legacy ||
+        node.tweet?.core?.user_results?.result ||
+        null;
+      // Sometimes legacy is one level deeper
+      const uLegacy = u?.legacy || u;
+      const uResult = node.core?.user_results?.result || node.tweet?.core?.user_results?.result;
       out.push({
         id,
         text: tw.full_text,
@@ -277,9 +295,9 @@ function extractTweets(data) {
         isRetweet: !!tw.retweeted_status_result,
         isQuote: !!tw.is_quote_status,
         hasUrls: !!(tw.entities?.urls?.length),
-        authorHandle: u?.legacy?.screen_name || null,
-        authorName: u?.legacy?.name || null,
-        authorFollowers: u?.legacy?.followers_count || 0,
+        authorHandle: uLegacy?.screen_name || uResult?.legacy?.screen_name || null,
+        authorName: uLegacy?.name || uResult?.legacy?.name || null,
+        authorFollowers: uLegacy?.followers_count || uResult?.legacy?.followers_count || 0,
       });
     }
     for (const k of Object.keys(node)) stack.push(node[k]);
