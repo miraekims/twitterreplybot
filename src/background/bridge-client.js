@@ -12,19 +12,41 @@
 //   either way:   { type: 'ping' / 'pong' }
 //   ext  -> bot:  { type: 'op.summary', ops }   (push on capture changes)
 //
-// MV3 service worker realities:
-//   - SW is killed after ~30s of inactivity. A live WebSocket is enough to
-//     keep it alive — the inbound ping every 25s from the server counts as
-//     activity and resets the idle timer. So *as long as we're connected*
-//     we stay alive. When the WS dies, the SW does too, and Chrome wakes
-//     it up next time something touches the extension. We then reconnect.
-//   - We also register a chrome.alarms-based watchdog that pokes the
-//     reconnect logic. See keepalive.js.
+// MV3 service worker realities and the reconnect-loop fix
+// -------------------------------------------------------
 //
-// Backoff: 1s, 2s, 4s, 8s, ... capped at 30s. Resets on a successful hello.
+// We hit a feedback loop where the SW reconnected to the bridge every
+// ~2 seconds (visible in the bot log as a stream of "extension
+// connected" / "replaced by newer connection"). Trace:
+//
+//   1. SW boots, opens ws₁, registers it as module-level `ws`
+//   2. SW idles. Despite the live WebSocket the SW can still get
+//      suspended between bursts of activity (the 30s idle timer is
+//      supposed to be paused for active WS but in practice MV3
+//      sometimes evicts anyway).
+//   3. SW wakes on next inbound RPC. Module re-imports → `ws = null`.
+//   4. startBridge() schedules a fresh connect → ws₂ opens.
+//   5. Bot sees a second connection from the same client and closes
+//      ws₁ with code 4004 ("replaced by newer connection").
+//   6. ws₁'s close handler runs in the extension. The OLD code
+//      blindly cleared module state — but `ws` was already pointing
+//      at ws₂. We just nulled out the live socket.
+//   7. scheduleReconnect → ws₃ → goto 5. Loop.
+//
+// Two fixes:
+//   - Each socket carries an identity (the local `socket` var). Its
+//     close handler only mutates module state if `ws === socket`. If
+//     a newer connect already swapped in another ws, the close is a
+//     no-op for module state.
+//   - scheduleReconnect bails out if a healthy ws is already there,
+//     not just if a reconnect is already pending. So the wake-up
+//     `startBridge()` doesn't open a needless second connection.
+//
+// Backoff on real failures: 1s, 2s, 4s, 8s, ... capped at 30s. Resets
+// on a successful hello.
 
 import { storage } from '../core/storage.js';
-import { getAllOps, getHeaders } from './query-registry.js';
+import { getAllOps } from './query-registry.js';
 
 const SETTINGS_KEY = 'bridge.settings';
 const STATUS_KEY = 'bridge.status';
@@ -95,6 +117,14 @@ export function ensureConnected() {
 }
 
 function scheduleReconnect(delayMs) {
+  // Bail if a healthy or pending socket already exists. Without this
+  // a transient call to scheduleReconnect (typically from startBridge
+  // on every SW wake-up) would try to open a second ws while ws₁ is
+  // still alive — the bot then evicts ws₁ → ws₁'s close handler ran
+  // (in the old code) → infinite reconnect loop.
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -146,14 +176,20 @@ async function connect() {
   console.log(`[xbot bridge] connecting to ${url} ...`);
   await setStatus({ connected: false, connecting: true, lastError: null });
 
-  ws = new WebSocket(url);
+  // `socket` is the per-attempt identity. Every event handler on this
+  // socket checks `ws === socket` before mutating module state, so a
+  // delayed close from a previous attempt cannot null out a healthy
+  // newer ws.
+  const socket = new WebSocket(url);
+  ws = socket;
 
-  ws.addEventListener('open', async () => {
+  socket.addEventListener('open', async () => {
+    if (ws !== socket) return; // we've already been replaced
     console.log('[xbot bridge] socket open, sending hello');
     const handle = await readLoggedInHandle();
     const extVersion = chrome.runtime.getManifest().version;
     const opSummary = await buildOpSummary();
-    safeSend({ type: 'hello', token, handle, extVersion, opSummary });
+    safeSend(socket, { type: 'hello', token, handle, extVersion, opSummary });
 
     reconnectAttempt = 0;
     await setStatus({
@@ -163,28 +199,28 @@ async function connect() {
 
     // Keepalive ping. The bot also pings us; this is belt-and-suspenders.
     if (pingTimer) clearInterval(pingTimer);
-    pingTimer = setInterval(() => safeSend({ type: 'ping' }), PING_INTERVAL_MS);
+    pingTimer = setInterval(() => safeSend(socket, { type: 'ping' }), PING_INTERVAL_MS);
 
     // Push op-summary updates on every new capture. Coarse but cheap —
     // chrome.storage onChange fires on each recordObservation.
     if (opSummaryUnsub) opSummaryUnsub();
-    opSummaryUnsub = subscribeToOpUpdates();
+    opSummaryUnsub = subscribeToOpUpdates(socket);
   });
 
-  ws.addEventListener('message', async (ev) => {
+  socket.addEventListener('message', async (ev) => {
     let frame;
     try { frame = JSON.parse(ev.data); }
     catch { console.warn('[xbot bridge] bad JSON from server'); return; }
 
     if (frame.type === 'pong' || frame.type === 'ping') {
-      if (frame.type === 'ping') safeSend({ type: 'pong' });
+      if (frame.type === 'ping') safeSend(socket, { type: 'pong' });
       return;
     }
 
     if (frame.type === 'rpc.req') {
-      handleRpc(frame).catch((e) => {
+      handleRpc(socket, frame).catch((e) => {
         console.error('[xbot bridge] rpc handler crashed:', e);
-        safeSend({
+        safeSend(socket, {
           type: 'rpc.res', id: frame.id,
           error: { message: e && e.message ? e.message : String(e) },
         });
@@ -193,16 +229,26 @@ async function connect() {
     }
   });
 
-  ws.addEventListener('close', async (ev) => {
+  socket.addEventListener('close', async (ev) => {
+    const reason = `code=${ev.code} ${ev.reason || ''}`.trim();
+    // CRITICAL: only act on this close if we're still the current
+    // socket. If a newer connect() already swapped in another ws,
+    // leave module state alone — otherwise we'd null out the live
+    // ws pointer and trigger another reconnect.
+    if (ws !== socket) {
+      console.log(`[xbot bridge] stale socket closed (${reason}); ignoring`);
+      return;
+    }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     if (opSummaryUnsub) { try { opSummaryUnsub(); } catch {} opSummaryUnsub = null; }
     ws = null;
-    const reason = `code=${ev.code} ${ev.reason || ''}`.trim();
     console.warn(`[xbot bridge] socket closed: ${reason}`);
     await setStatus({ connected: false, connecting: false, lastError: reason });
 
     // 4001-4003 are auth/protocol errors from the server — backoff long.
-    // Network disconnects are fast to retry.
+    // Network disconnects are fast to retry. 4004 ("replaced") never
+    // arrives here because the replaced socket is the OLD one and its
+    // close is filtered above.
     const longBackoff = ev.code >= 4001 && ev.code <= 4003;
     if (longBackoff) {
       reconnectAttempt = Math.max(reconnectAttempt, 4); // ~16s+ delay
@@ -213,28 +259,28 @@ async function connect() {
     scheduleReconnect(next);
   });
 
-  ws.addEventListener('error', (e) => {
+  socket.addEventListener('error', (e) => {
     console.warn('[xbot bridge] socket error', e && (e.message || ''));
     // close handler will fire next; do not reconnect from here.
   });
 }
 
-function safeSend(obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  try { ws.send(JSON.stringify(obj)); return true; }
+function safeSend(socket, obj) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  try { socket.send(JSON.stringify(obj)); return true; }
   catch (e) { console.warn('[xbot bridge] send failed:', e.message); return false; }
 }
 
-async function handleRpc(req) {
+async function handleRpc(socket, req) {
   if (!_rpcHandler) {
-    safeSend({ type: 'rpc.res', id: req.id, error: { message: 'no rpc handler registered' } });
+    safeSend(socket, { type: 'rpc.res', id: req.id, error: { message: 'no rpc handler registered' } });
     return;
   }
   try {
     const result = await _rpcHandler(req.method, req.params || {});
-    safeSend({ type: 'rpc.res', id: req.id, result });
+    safeSend(socket, { type: 'rpc.res', id: req.id, result });
   } catch (e) {
-    safeSend({
+    safeSend(socket, {
       type: 'rpc.res', id: req.id,
       error: {
         message: e && e.message ? e.message : String(e),
@@ -248,7 +294,7 @@ async function handleRpc(req) {
 // Listen for op-cache changes and push a summary up the WS. We coalesce
 // rapid-fire updates with a 1s debounce — every page request doesn't need
 // to push a frame.
-function subscribeToOpUpdates() {
+function subscribeToOpUpdates(socket) {
   let pending = false;
   const handler = async (changes, area) => {
     if (area !== 'local') return;
@@ -261,7 +307,7 @@ function subscribeToOpUpdates() {
       const json = JSON.stringify(ops);
       if (json === lastPushedSummary) return;
       lastPushedSummary = json;
-      safeSend({ type: 'op.summary', ops });
+      safeSend(socket, { type: 'op.summary', ops });
     }, 1000);
   };
   chrome.storage.onChanged.addListener(handler);
