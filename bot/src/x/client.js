@@ -49,28 +49,41 @@ async function probeCurl() {
   return curlAvailable;
 }
 
-// Chrome's actual headers, in Chrome's actual order.
-function chromeHeaderArgs({ ct0, lang = 'en', isPost = false }) {
+// Chrome's actual headers, in Chrome's actual order. Matched against a real
+// Chrome 144 request captured from DevTools on 2026-05-18.
+//
+// Key findings from comparing bot vs real Chrome:
+//   - Chrome sends content-type: application/json even on GET (X expects it)
+//   - Chrome does NOT send origin on same-origin GET (only on POST)
+//   - Chrome sends x-client-transaction-id (REQUIRED — X returns 404 without it)
+//   - Chrome sends priority: u=1, i
+function chromeHeaderArgs({ ct0, lang = 'en', isPost = false, transactionId = null }) {
   const headers = [
-    ['sec-ch-ua', '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'],
+    ['accept', '*/*'],
+    ['accept-language', 'en-US,en;q=0.9'],
+    ['authorization', PUBLIC_BEARER],
+    ['content-type', 'application/json'],
+    ['priority', 'u=1, i'],
+    ['referer', 'https://x.com/search?q=crypto&src=typed_query'],
+    ['sec-ch-ua', '"Chromium";v="144", "Google Chrome";v="144", "Not-A.Brand";v="99"'],
     ['sec-ch-ua-mobile', '?0'],
-    ['sec-ch-ua-platform', '"Windows"'],
+    ['sec-ch-ua-platform', '"macOS"'],
     ['sec-fetch-dest', 'empty'],
     ['sec-fetch-mode', 'cors'],
     ['sec-fetch-site', 'same-origin'],
-    ['authorization', PUBLIC_BEARER],
+    ['user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'],
+    ['x-client-transaction-id', transactionId],
     ['x-csrf-token', ct0],
     ['x-twitter-active-user', 'yes'],
     ['x-twitter-auth-type', 'OAuth2Session'],
     ['x-twitter-client-language', lang],
-    ['accept', '*/*'],
-    ['accept-language', 'en-US,en;q=0.9'],
-    ['referer', HOMEPAGE],
-    ['origin', 'https://x.com'],
   ];
-  if (isPost) headers.push(['content-type', 'application/json']);
+  // Only add origin on POST (Chrome doesn't send it on same-origin GET)
+  if (isPost) headers.splice(5, 0, ['origin', 'https://x.com']);
   const args = [];
-  for (const [k, v] of headers) args.push('-H', `${k}: ${v}`);
+  for (const [k, v] of headers) {
+    if (v != null) args.push('-H', `${k}: ${v}`);
+  }
   return args;
 }
 
@@ -121,10 +134,11 @@ function runCurl({ method, url, headers, cookieHeader, body, proxy }) {
 }
 
 export class XClient {
-  constructor({ secrets, proxy = null, lang = 'en' }) {
+  constructor({ secrets, proxy = null, lang = 'en', transactionId = null }) {
     this.secrets = secrets;
     this.proxy = proxy;
     this.lang = lang;
+    this.transactionId = transactionId;
   }
 
   async _request(method, url, { body = null } = {}) {
@@ -133,6 +147,7 @@ export class XClient {
     const cookieHeader = `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`;
     const headers = chromeHeaderArgs({
       ct0: this.secrets.ct0, lang: this.lang, isPost,
+      transactionId: this.transactionId,
     });
 
     if (ok) {

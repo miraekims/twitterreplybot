@@ -45,3 +45,15 @@ export const capturedOps = new Proxy({}, {
     return FALLBACK[key] || null;
   },
 });
+
+// Extract x-client-transaction-id from captured headers.
+// The user stores this in captured-ops.json under "_headers" key:
+//   { "_headers": { "x-client-transaction-id": "..." }, "SearchTimeline": {...}, ... }
+// Falls back to null if not present.
+export function getCapturedTransactionId() {
+  const override = loadOverride();
+  if (override && override._headers && override._headers['x-client-transaction-id']) {
+    return override._headers['x-client-transaction-id'];
+  }
+  return null;
+}
