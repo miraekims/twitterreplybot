@@ -25,9 +25,46 @@ let cachedCt = null;       // ClientTransaction instance
 let cacheCreatedAt = 0;
 let ClientTransaction = null;
 let initAttempted = false;
+// Diagnostics: how many times we've fallen through to static / null fallback.
+// Surfaced once per 100 calls so prod logs aren't drowned but we can spot
+// silent regression to the static header.
+let _genCount = 0;
+let _fallbackCount = 0;
 
 // Stored cookies for authenticated fetches (set by first caller)
 let _cookies = null;
+
+// Permissive variants of the lib's INDICES_REGEX. The published v0.0.2 only
+// matches single-letter variable names — `(\w\[(\d{1,2})\],\s*16\)` — which
+// breaks against newer X ondemand bundles where the minifier emits multi-char
+// identifiers (e.g. `(ab[5], 16)`). We try patterns from most-specific to
+// least-specific and use the first that returns at least 2 matches (rowIndex
+// + at least one keyByte index).
+const INDICES_PATTERNS = [
+  // Original lib pattern, kept for back-compat with old bundles.
+  /(\(\w\[(\d{1,2})\],\s*16\))/g,
+  // Multi-char identifier, 1–3 digit index. Covers post-2025 minified output.
+  /\(([A-Za-z_$][\w$]*)\[(\d{1,3})\],\s*16\)/g,
+  // Even looser: any identifier-ish thing followed by [N], 16.
+  /\(([A-Za-z0-9_$]+)\[(\d{1,3})\]\s*,\s*16\s*\)/g,
+];
+
+function patchedGetIndices(ondemandFileResponse) {
+  for (const re of INDICES_PATTERNS) {
+    re.lastIndex = 0;
+    const matches = [...ondemandFileResponse.matchAll(re)];
+    if (matches.length >= 2) {
+      const indices = matches.map((m) => parseInt(m[2], 10));
+      return [indices[0], ...indices.slice(1)];
+    }
+  }
+  // Last-resort: if we can find at least one `,16)` token, surface a more
+  // informative error so the user knows the bundle shape changed entirely.
+  const has16 = /,\s*16\s*\)/.test(ondemandFileResponse);
+  throw new Error(
+    `Couldn't get KEY_BYTE indices (ondemand=${ondemandFileResponse.length}b, ,16) tokens=${has16 ? 'present' : 'absent'})`,
+  );
+}
 
 async function loadLib() {
   if (initAttempted) return ClientTransaction;
@@ -39,7 +76,11 @@ async function loadLib() {
       logger.warn('txid', 'xclienttransaction loaded but ClientTransaction not found');
       return null;
     }
-    logger.info('txid', 'xclienttransaction loaded — auto-generation enabled');
+    // Monkey-patch getIndices on the prototype. The constructor calls
+    // `this.getIndices(...)`, so a prototype override is picked up cleanly.
+    // This is the smallest viable fix until upstream lands a permissive regex.
+    ClientTransaction.prototype.getIndices = patchedGetIndices;
+    logger.info('txid', 'xclienttransaction loaded (patched indices regex) — auto-generation enabled');
   } catch (e) {
     logger.warn('txid', `xclienttransaction not available (${e.message}) — using static fallback`);
     ClientTransaction = null;
@@ -139,7 +180,10 @@ export async function generateTransactionId(method, path, cookies = null) {
   if (cachedCt) {
     try {
       const tid = cachedCt.generateTransactionId(method, path);
-      if (tid) return tid;
+      if (tid) {
+        _genCount++;
+        return tid;
+      }
     } catch (e) {
       logger.warn('txid', `generation failed: ${e.message}`);
     }
@@ -147,6 +191,10 @@ export async function generateTransactionId(method, path, cookies = null) {
 
   // Fallback: static value from captured-ops.json _headers
   const fallback = getCapturedTransactionId();
+  _fallbackCount++;
+  if ((_genCount + _fallbackCount) % 100 === 0) {
+    logger.info('txid', `stats: generated=${_genCount}, fallback=${_fallbackCount} (last 100 batch)`);
+  }
   if (fallback) return fallback;
 
   // Last resort: null (request will probably 404, but at least we tried)
