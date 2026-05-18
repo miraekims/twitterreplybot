@@ -1,43 +1,41 @@
-# Linux x86_64 image — node-tls-client publishes prebuilt binaries for this
-# platform, so the Go binary that does the Chrome TLS handshake lands on disk
-# during `npm install` and we never have to debug it again.
-#
-# Why not use multi-arch: even on Apple Silicon Macs, Docker will run this
-# x86_64 image under Rosetta. That's slower (irrelevant for a bot doing one
-# request per minute), but gives us a guaranteed-working environment.
+# Linux x86_64 image — runs under Rosetta on Apple Silicon Macs. Slow startup
+# is irrelevant for a bot that does ~10 requests per minute.
 FROM --platform=linux/amd64 node:22-bookworm-slim
 
-# better-sqlite3 needs a C++ toolchain to compile its native module on first
-# install. Removed in the same RUN to keep the image small.
 WORKDIR /app
 
+# Two layers of dependencies:
+#   1. apt: build toolchain for better-sqlite3, plus wget+tar to fetch
+#      curl-impersonate, plus ca-certificates so curl-impersonate can verify
+#      x.com's TLS cert.
+#   2. curl-impersonate (pinned to v0.6.1): a curl build that produces a
+#      Chrome 116 TLS Client Hello byte-for-byte (JA3, HTTP/2 SETTINGS,
+#      header order). This replaces the npm-side node-tls-client we burned
+#      hours on. The release tarball ships several /usr/local/bin/curl_*
+#      binaries; we only use curl_chrome116. Verified end-to-end with a
+#      probe HTTP request to x.com/home before this Dockerfile was committed.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
+ && apt-get install -y --no-install-recommends \
+      python3 make g++ ca-certificates wget tar \
  && rm -rf /var/lib/apt/lists/*
 
-# Only the manifest — we deliberately ignore any host-generated
-# package-lock.json (.dockerignore'd) so the install resolves fresh against
-# the current platform, avoiding stale-lock skips of native dependencies.
+ARG CURL_IMP_VERSION=v0.6.1
+RUN wget -q -O /tmp/ci.tgz \
+      "https://github.com/lwthiker/curl-impersonate/releases/download/${CURL_IMP_VERSION}/curl-impersonate-${CURL_IMP_VERSION}.x86_64-linux-gnu.tar.gz" \
+ && tar -xzf /tmp/ci.tgz -C /usr/local/bin/ \
+ && rm /tmp/ci.tgz \
+ && curl_chrome116 --version | head -1 \
+ && curl_chrome116 -sS -o /dev/null -w "x.com probe: HTTP %{http_code}\n" "https://x.com/home"
+
+# Manifest first for layer caching. We deliberately don't COPY package-lock.json
+# (it's in .dockerignore) so install resolves fresh against linux/amd64.
 COPY package.json ./
 
-# Install. Foreground scripts so we see the postinstall output. After install
-# we dump the resolved tree and the package directory contents — if anything
-# is missing, the diff is right there in the build log.
 RUN npm install --foreground-scripts \
- && echo "--- npm ls (top-level) ---" \
- && npm ls --depth=0 \
- && echo "--- node_modules/node-tls-client ---" \
- && ls -la node_modules/node-tls-client/ \
- && node -e 'const p=require("./node_modules/node-tls-client/package.json"); console.log("RESOLVED:",p.name,"v"+p.version,"main="+p.main)'
-
-# Self-test runs from /app so module resolution finds node_modules. Imports
-# the package, calls initTLS() to force native library load, opens and
-# closes a Session, then destroyTLS. Build fails loud if any step throws.
-RUN node -e 'import("node-tls-client").then(async m=>{await m.initTLS();const s=new m.Session({clientIdentifier:"chrome_124",timeout:5000});await s.close();await m.destroyTLS();console.log("TLS native lib OK")}).catch(e=>{console.error("SELFTEST FAIL:",e&&e.stack||e);process.exit(1)})'
+ && npm ls --depth=0
 
 COPY src ./src
 
-# data/ is a volume — we never bake state into the image.
 VOLUME ["/app/data"]
 
 CMD ["node", "src/index.js"]

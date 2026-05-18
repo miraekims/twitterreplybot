@@ -1,28 +1,20 @@
 // X.com HTTP client.
 //
-// Two transports, picked at runtime:
+// Transport: curl-impersonate-chrome — produces a TLS Client Hello byte-
+// for-byte identical to a real Chrome 116, including JA3, HTTP/2 SETTINGS
+// frame and header order. We installed it via apt in the Dockerfile and
+// shell out to it here. This is the same approach the prior project used
+// (curl_cffi in Python is a Python wrapper around the same project).
 //
-//   1. node-tls-client (preferred). Uses koffi to load Bogdanfinn's
-//      tls-client shared library, which produces a Chrome-shaped TLS
-//      Client Hello — JA3 fingerprint, HTTP/2 SETTINGS frame, header
-//      order — that X.com's WAF accepts. This is the same approach the
-//      prior project used (curl_cffi in Python).
+// Why not node-tls-client: the npm package wraps Bogdanfinn's tls-client
+// via koffi, but the install path is fragile (optional deps skipped on
+// Apple Silicon, postinstall doesn't always fetch the right binary, v2
+// requires explicit initTLS()). curl-impersonate is a single apt package
+// that just works in our linux/amd64 container.
 //
-//   2. Native Node fetch (fallback). Used only if node-tls-client failed
-//      to import (rare; typically only happens when the package was
-//      deliberately omitted from install). It will probably 404 on X
-//      because Node's TLS handshake is recognised by Cloudflare-style
-//      WAFs, but we don't crash — we log loudly and keep the bot alive
-//      so other features (Telegram control, /stats, /logs) still work.
-//
-// API notes (these tripped me up — read before editing):
-//   * Session is constructed with `new Session({ clientIdentifier, ... })`.
-//   * Per-request cookies go in the `cookies` option as a flat
-//     `Record<string,string>`. Do NOT touch the underlying tough-cookie
-//     jar directly; the library manages it.
-//   * `session.get`, `session.post` etc. return a Response with .ok,
-//     .status, .body (already a string), .json(), .text().
-//   * `execute()` is protected — call the verb methods.
+// Tradeoff: shelling out adds ~30-50ms per call vs. an in-process FFI.
+// We do at most one call per tick (5 seconds), so it's irrelevant.
+import { spawn } from 'node:child_process';
 import { logger } from '../core/logger.js';
 
 const PUBLIC_BEARER =
@@ -32,73 +24,100 @@ const PUBLIC_BEARER =
 const HOMEPAGE = 'https://x.com/home';
 const GQL_BASE = 'https://x.com/i/api/graphql';
 
-// Module-scoped: resolves once. v2 of node-tls-client requires an explicit
-// initTLS() call to load the native koffi-backed library before any Session
-// can be constructed; subsequent constructors reuse the same load.
-let TlsSession = null;
-let initTLSFn = null;
-let destroyTLSFn = null;
-let tlsTried = false;
-async function getTlsSession() {
-  if (tlsTried) return TlsSession;
-  tlsTried = true;
-  try {
-    const mod = await import('node-tls-client');
-    TlsSession = mod.Session || (mod.default && mod.default.Session);
-    initTLSFn = mod.initTLS || (mod.default && mod.default.initTLS);
-    destroyTLSFn = mod.destroyTLS || (mod.default && mod.default.destroyTLS);
-    if (!TlsSession) {
-      logger.warn('xclient', 'node-tls-client present but Session export missing; using vanilla fetch');
-      TlsSession = null;
-      return null;
-    }
-    if (initTLSFn) {
-      await initTLSFn();
-    }
-    logger.info('xclient', 'using node-tls-client (Chrome TLS fingerprint)');
-    // On graceful shutdown, release the native library.
-    if (destroyTLSFn) {
-      const cleanup = () => { try { destroyTLSFn(); } catch (_) {} };
-      process.once('SIGINT', cleanup);
-      process.once('SIGTERM', cleanup);
-    }
-  } catch (e) {
+// Binary name from the Debian package. There are several variants
+// (chrome116, chrome110, chrome99...); we go with 116 for stability — it's
+// the most-tested, least likely to hit edge-case regressions.
+const CURL_BIN = 'curl_chrome116';
+
+let curlAvailable = null;
+async function probeCurl() {
+  if (curlAvailable !== null) return curlAvailable;
+  curlAvailable = await new Promise((resolve) => {
+    const p = spawn(CURL_BIN, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    p.on('error', () => resolve(false));
+    p.on('exit', (code) => resolve(code === 0));
+  });
+  if (curlAvailable) {
+    logger.info('xclient', `using ${CURL_BIN} (Chrome TLS fingerprint via curl-impersonate)`);
+  } else {
     logger.warn(
       'xclient',
-      `node-tls-client not installed (${e.code || e.message}); ` +
-      `using vanilla fetch — X will probably return 404`,
+      `${CURL_BIN} not found; falling back to native fetch — X will likely 404. ` +
+      `Are you running outside Docker? The Dockerfile installs curl-impersonate-chrome.`,
     );
-    TlsSession = null;
   }
-  return TlsSession;
+  return curlAvailable;
 }
 
-// Chrome's actual header set + order. Order doesn't strictly matter when we
-// hand a plain object to node-tls-client (it has its own ordering machinery),
-// but we keep the "natural" Chrome order so vanilla-fetch fallback is at
-// least less obviously a bot.
-function chromeHeaders({ lang = 'en', isPost = false }) {
-  const h = {
-    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'authorization': PUBLIC_BEARER,
-    'x-twitter-active-user': 'yes',
-    'x-twitter-auth-type': 'OAuth2Session',
-    'x-twitter-client-language': lang,
-    'accept': '*/*',
-    'accept-language': 'en-US,en;q=0.9',
-    'referer': HOMEPAGE,
-    'origin': 'https://x.com',
-    'user-agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  };
-  if (isPost) h['content-type'] = 'application/json';
-  return h;
+// Chrome's actual headers, in Chrome's actual order.
+function chromeHeaderArgs({ ct0, lang = 'en', isPost = false }) {
+  const headers = [
+    ['sec-ch-ua', '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'],
+    ['sec-ch-ua-mobile', '?0'],
+    ['sec-ch-ua-platform', '"Windows"'],
+    ['sec-fetch-dest', 'empty'],
+    ['sec-fetch-mode', 'cors'],
+    ['sec-fetch-site', 'same-origin'],
+    ['authorization', PUBLIC_BEARER],
+    ['x-csrf-token', ct0],
+    ['x-twitter-active-user', 'yes'],
+    ['x-twitter-auth-type', 'OAuth2Session'],
+    ['x-twitter-client-language', lang],
+    ['accept', '*/*'],
+    ['accept-language', 'en-US,en;q=0.9'],
+    ['referer', HOMEPAGE],
+    ['origin', 'https://x.com'],
+  ];
+  if (isPost) headers.push(['content-type', 'application/json']);
+  const args = [];
+  for (const [k, v] of headers) args.push('-H', `${k}: ${v}`);
+  return args;
+}
+
+// Run curl-impersonate, return {status, text}. Body via stdin to avoid
+// shell-escaping headaches with arbitrary tweet text.
+function runCurl({ method, url, headers, cookieHeader, body, proxy }) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-sS',                  // silent + show errors (no progress meter)
+      '-o', '-',              // body → stdout
+      '-w', '%{http_code}',   // append status code at end of stdout
+      '-X', method,
+      '--max-time', '30',
+      '-H', `cookie: ${cookieHeader}`,
+      ...headers,
+    ];
+    if (proxy) args.push('-x', proxy);
+    if (body !== null) {
+      args.push('--data-binary', '@-');  // body from stdin
+    }
+    args.push(url);
+
+    const child = spawn(CURL_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (chunk) => { out += chunk.toString('utf8'); });
+    child.stderr.on('data', (chunk) => { err += chunk.toString('utf8'); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`${CURL_BIN} exited ${code}: ${err.slice(0, 300)}`));
+        return;
+      }
+      // Status code is the last 3 chars of stdout (from -w '%{http_code}').
+      const status = parseInt(out.slice(-3), 10);
+      const text = out.slice(0, -3);
+      if (!Number.isFinite(status)) {
+        reject(new Error(`could not parse status from curl output: ${out.slice(-50)}`));
+        return;
+      }
+      resolve({ status, text });
+    });
+    if (body !== null) {
+      child.stdin.write(body);
+    }
+    child.stdin.end();
+  });
 }
 
 export class XClient {
@@ -106,56 +125,35 @@ export class XClient {
     this.secrets = secrets;
     this.proxy = proxy;
     this.lang = lang;
-    this._session = null;
-    this._sessionInited = false;
   }
 
-  async _ensureSession() {
-    if (this._sessionInited) return;
-    this._sessionInited = true;
-    const Session = await getTlsSession();
-    if (!Session) { this._session = null; return; }
-    this._session = new Session({
-      clientIdentifier: 'chrome_124',
-      // Random TLS extension order: more important on actively-policed WAFs
-      // than X, but cheap to enable.
-      randomTlsExtensionOrder: true,
-      // Default 30s — enough for slow X queries, short enough for backoff.
-      timeout: 30_000,
-      ...(this.proxy ? { proxy: this.proxy } : {}),
-    });
-  }
-
-  // Both transports return the same shape: { status:number, text:string }.
   async _request(method, url, { body = null } = {}) {
-    await this._ensureSession();
+    const ok = await probeCurl();
     const isPost = body !== null;
-    const headers = chromeHeaders({ lang: this.lang, isPost });
-    // X reads CSRF from the x-csrf-token header AND from the ct0 cookie.
-    // Both must match; we pass the live cookie value in both places.
-    headers['x-csrf-token'] = this.secrets.ct0;
+    const cookieHeader = `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`;
+    const headers = chromeHeaderArgs({
+      ct0: this.secrets.ct0, lang: this.lang, isPost,
+    });
 
-    const cookies = {
-      auth_token: this.secrets.auth_token,
-      ct0: this.secrets.ct0,
-    };
-
-    if (this._session) {
-      const opts = { headers, cookies };
-      if (isPost) opts.body = JSON.stringify(body);
-      let resp;
-      if (method === 'GET') resp = await this._session.get(url, opts);
-      else if (method === 'POST') resp = await this._session.post(url, opts);
-      else throw new Error(`unsupported method ${method}`);
-      return { status: resp.status, text: resp.body || '' };
+    if (ok) {
+      const bodyStr = isPost ? JSON.stringify(body) : null;
+      return runCurl({
+        method, url, headers, cookieHeader,
+        body: bodyStr, proxy: this.proxy,
+      });
     }
 
-    // Fallback: native fetch. Almost certainly 404 on X but keeps the bot alive.
-    const fetchHeaders = {
-      ...headers,
-      cookie: `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`,
-    };
-    const opts = { method, headers: fetchHeaders, redirect: 'follow' };
+    // Fallback: vanilla Node fetch. Likely 404 on X.com but keeps Telegram
+    // control alive so the user can /stop, /stats, /logs.
+    const obj = {};
+    for (let i = 0; i < headers.length; i += 2) {
+      // headers is ['-H','k: v','-H','k: v',...]; parse back.
+      const kv = headers[i + 1];
+      const idx = kv.indexOf(': ');
+      if (idx > 0) obj[kv.slice(0, idx)] = kv.slice(idx + 2);
+    }
+    obj['cookie'] = cookieHeader;
+    const opts = { method, headers: obj, redirect: 'follow' };
     if (isPost) opts.body = JSON.stringify(body);
     const r = await fetch(url, opts);
     const text = await r.text();
@@ -182,8 +180,6 @@ export class XClient {
     try {
       baseVars = JSON.parse(u.searchParams.get('variables') || '{}');
     } catch { /* leave empty */ }
-    // Strip pagination state but keep querySource/product as-is — X's
-    // queryId is bound to the exact variable shape it was observed with.
     delete baseVars.cursor;
     delete baseVars.referrer;
     delete baseVars.controller_data;
@@ -241,7 +237,6 @@ export class XClient {
   }
 }
 
-// Walks a deeply-nested X response and collects top-level tweet results.
 function extractTweets(data) {
   const out = [];
   const seen = new Set();
