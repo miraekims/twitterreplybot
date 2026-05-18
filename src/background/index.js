@@ -7,6 +7,12 @@ import {
   registerAlarmHandler,
 } from '../core/auto-runner.js';
 
+// Bumped on every code-meaningful change. The UI surfaces this so we can
+// instantly tell whether the running SW is actually the latest one
+// (chrome.tabs F5 does NOT reload the SW; only chrome://extensions Reload does).
+const EXT_VERSION = '0.4.0';
+console.log(`[xbot] service worker booted, version ${EXT_VERSION}`);
+
 // Register at top level so the SW re-registers on every wake-up.
 registerAlarmHandler();
 
@@ -24,7 +30,9 @@ const handlers = {
     return {
       ops: summary,
       hasAuth: !!headers.authorization,
+      hasTxId: !!headers['x-client-transaction-id'],
       ready: !!ops.SearchTimeline && !!ops.CreateTweet && !!headers.authorization,
+      extVersion: EXT_VERSION,
     };
   },
   // legacy (Comments tab — kept for later)

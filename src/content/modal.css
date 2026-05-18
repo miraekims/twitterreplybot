@@ -195,3 +195,6 @@
 
 /* Single-column variant for full-width fields like blacklists. */
 .xbot-grid.xbot-grid-1 { grid-template-columns: 1fr; }
+
+.xbot-ver { font-size: 11px; color: var(--xbot-muted); opacity: 0.7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

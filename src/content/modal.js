@@ -366,6 +366,12 @@ const XBotModal = (() => {
     if (autoState.status === 'running') { statusDot.classList.add('run'); statusText.textContent = 'Auto-reply running'; }
     else if (ok) { statusDot.classList.add('ok'); statusText.textContent = 'Ready'; }
     else { statusDot.classList.add('warn'); statusText.textContent = 'Warming up — search something on X & post once'; }
+    // Update version stamp from latest capture.state response.
+    const stamp = root.querySelector('.xbot-ver');
+    if (stamp && captureState.extVersion) {
+      stamp.textContent = 'v' + captureState.extVersion;
+      stamp.title = 'Service worker version. If this is older than what you pulled — go to chrome://extensions and click Reload on this extension.';
+    }
   }
 
   function fmtTime(ts) { return new Date(ts).toLocaleTimeString(); }
@@ -446,7 +452,13 @@ const XBotModal = (() => {
 
     statusDot = el('span', { class: 'xbot-dot warn' });
     statusText = el('span', {}, 'Initializing…');
-    const statusBar = el('div', { class: 'xbot-status' }, statusDot, statusText);
+    // Version stamp lets us instantly tell if a code update actually loaded.
+    // chrome://extensions Reload button is required — F5 alone WON'T update
+    // the service worker.
+    const versionStamp = el('span', { class: 'xbot-ver' }, 'v?');
+    const statusBar = el('div', { class: 'xbot-status' }, statusDot, statusText,
+      el('span', { style: 'flex:1' }), versionStamp);
+    statusBar._versionStamp = versionStamp;
 
     modal = el('div', { id: 'xbot-modal' }, header, tabs, body, statusBar);
 

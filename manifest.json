@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X Reply Bot",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Modal-based automation for X.com replies (comments / search / by @username).",
   "permissions": ["storage", "cookies", "scripting", "alarms"],
   "host_permissions": [

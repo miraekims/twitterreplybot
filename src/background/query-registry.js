@@ -16,8 +16,10 @@ const HEADERS_KEY = 'capture.headers';
 
 // Headers that are safe (and necessary) to replay. Anything else is dropped.
 // Notes:
-//   - x-client-transaction-id is intentionally excluded: it's a per-request
-//     anti-replay token, reusing it can get the request rejected.
+//   - x-client-transaction-id IS replayed: empirically X returns 404 to GraphQL
+//     requests that lack it, even from a same-origin fetch. We update it on
+//     every observation so it stays fresh; the captured value is at most a few
+//     seconds old by the time we use it.
 //   - content-type is set per-call (only for POST), not stored globally.
 const ALLOWED_HEADERS = new Set([
   'authorization',
@@ -26,6 +28,7 @@ const ALLOWED_HEADERS = new Set([
   'x-twitter-auth-type',
   'x-twitter-client-language',
   'x-client-uuid',
+  'x-client-transaction-id',
 ]);
 
 function pickHeaders(h) {
