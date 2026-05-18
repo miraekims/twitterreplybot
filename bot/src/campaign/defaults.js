@@ -53,15 +53,24 @@ export const PRESETS = {
     maxRepliesPerHour: 30,
     diversityCooldownSec: 1200,
   },
-  // 1000 replies/day target. With sleep 01-08 we have 17 active hours;
-  // 1000 / 17 ≈ 59 sustained. Cap 70 leaves headroom for jitter & dry tick.
-  // Mean delay from log-normal with min=20, max=100 lands ~55-65s, which
-  // pairs cleanly with 60/h. searchEverySec=120 because we burn queue fast.
+  // 1000 replies/day target. Math: with sleep 01-08 we have 17 active hours
+  // and a hard hourly cap of 75 ⇒ 1275 ceiling, leaving headroom for:
+  //   (a) ~2.5s/reply supervisor-tick slop (≈ 40min/day at the target rate)
+  //   (b) jitter variance — log-normal mean with min=25,max=80 is ~50s,
+  //       which paired with the 75/h cap gives sustained ~64/h ⇒ 1088/day
+  //       on average, with the cap absorbing fast-window spikes.
+  //   (c) search misses & filtered-out tweets (the runner now refills the
+  //       queue immediately when the previous search was non-empty, so the
+  //       only real loss is a few seconds of search latency).
+  // The min/max delays are ALSO narrower than safe/medium — wider jitter on
+  // a high-volume account is a tell, not a feature; humans on Twitter don't
+  // pause 100s between replies during an active conversation but do pause
+  // 15-25s while typing.
   highvolume: {
-    minDelaySec: 20,
-    maxDelaySec: 100,
-    searchEverySec: 120,
-    maxRepliesPerHour: 70,
+    minDelaySec: 25,
+    maxDelaySec: 80,
+    searchEverySec: 90,
+    maxRepliesPerHour: 75,
     diversityCooldownSec: 600,
   },
 };

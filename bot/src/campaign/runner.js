@@ -7,18 +7,36 @@
 //   3. cooldown since last action not elapsed? → bail
 //   4. queue empty + searchEverySec elapsed? → search, refill queue
 //   5. queue has items? → reply to next tweet, dedup-mark
+//
+// Throughput notes (re: 1000-replies/day target):
+//   - The supervisor wakes every 5s, so the actual-vs-configured cooldown
+//     has up to ~2.5s slop per reply. At 1000/day that's ~42min/day of
+//     unrecoverable slop, baked into the math in defaults.js.
+//   - Cooldown is rolled ONCE per reply (stored in `nextEligibleAt`), not
+//     re-rolled on every tick. The previous version re-rolled per tick,
+//     which made the gate non-monotonic and reduced effective throughput
+//     because long rolls early in the window kept resetting the wait.
+//   - When the queue is empty, we search immediately if the last search
+//     was productive. Only when consecutive searches return empty do we
+//     fall back to the configured `searchEverySec` throttle. That avoids
+//     idling for 2 minutes with bandwidth still on the table.
 import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
 import { decryptJSON } from '../core/crypto.js';
 import { XClient } from '../x/client.js';
 import { capturedOps } from '../x/captured-ops.js';
-import { rewriteTemplate } from '../persona/persona.js';
+import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
 
 const PASSPHRASE = process.env.ENCRYPTION_PASSPHRASE;
 
-// Light in-memory queue cache; rebuilt on each search. Keyed by campaign id.
-const queues = new Map();
-const lastTickedAt = new Map();
+// Per-campaign in-memory state. Rebuilt fresh on process restart — the only
+// thing we lose is "next eligible at", which means a freshly-restarted bot
+// can fire one reply immediately. That's acceptable; the hourly token-bucket
+// in SQLite still bounds it.
+const queues = new Map();              // campaign_id → tweet[]
+const nextEligibleAt = new Map();      // campaign_id → timestamp ms
+const lastSearchEmpty = new Map();     // campaign_id → boolean (true = throttle)
+const sleepLogTickedAt = new Map();    // campaign_id → timestamp ms (rate-limit sleep msgs)
 
 export async function tickCampaign(campaign) {
   const cfg = JSON.parse(campaign.config_json);
@@ -28,10 +46,10 @@ export async function tickCampaign(campaign) {
   // Sleep window?
   const sleepRemain = inSleepWindow(cfg.sleep);
   if (sleepRemain != null) {
-    const last = lastTickedAt.get(campaign.id) || 0;
+    const last = sleepLogTickedAt.get(campaign.id) || 0;
     if (Date.now() - last > 60_000) {
       logger.info('runner', `c${campaign.id} in sleep window, ${Math.ceil(sleepRemain/60)}min left`, campaign.id);
-      lastTickedAt.set(campaign.id, Date.now());
+      sleepLogTickedAt.set(campaign.id, Date.now());
     }
     return;
   }
@@ -42,10 +60,11 @@ export async function tickCampaign(campaign) {
     return; // Will be re-checked next tick.
   }
 
-  // Cooldown since last action?
-  const sinceAction = Date.now() - (campaign.last_action_at || 0);
-  const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
-  if (campaign.last_action_at && sinceAction < cooldownMs) return;
+  // Cooldown since last action? Use the eligibility timestamp set after the
+  // PREVIOUS reply. If nothing scheduled (process just started, or never
+  // replied), we're eligible now.
+  const eligibleAt = nextEligibleAt.get(campaign.id) || 0;
+  if (Date.now() < eligibleAt) return;
 
   let client;
   try {
@@ -60,11 +79,18 @@ export async function tickCampaign(campaign) {
   // Search if queue empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
-    const sinceSearch = Date.now() - (campaign.last_search_at || 0);
-    if (campaign.last_search_at && sinceSearch < (cfg.pacing.searchEverySec || 180) * 1000) return;
+    // Throttle search ONLY if the previous search came back empty. If the
+    // last search produced tweets, the queue draining means we found
+    // engagement and should refill immediately. That's the difference
+    // between 1000/day and ~600/day.
+    if (lastSearchEmpty.get(campaign.id)) {
+      const sinceSearch = Date.now() - (campaign.last_search_at || 0);
+      if (campaign.last_search_at && sinceSearch < (cfg.pacing.searchEverySec || 180) * 1000) return;
+    }
     try {
       queue = await runSearchPhase(client, campaign, cfg);
       queues.set(campaign.id, queue);
+      lastSearchEmpty.set(campaign.id, queue.length === 0);
       db.bumpCampaignAction(campaign.id, 'search');
       logger.info('runner', `c${campaign.id} search → ${queue.length} usable`, campaign.id);
     } catch (e) {
@@ -91,9 +117,19 @@ export async function tickCampaign(campaign) {
       persona: cfg.persona,
     });
   } catch (e) {
-    text = renderTemplate(tpl, { author: t.authorHandle, name: t.authorName });
+    // AI configured but failed (timeout, rate-limit, etc). Fall back to
+    // literal substitution rather than skip — half a reply is better than
+    // none for a campaign at scale, and the next reply will retry the API.
+    text = literalSubstitute(tpl, t);
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
+
+  // Schedule next-eligible BEFORE the network call. If the call hangs we
+  // still won't fire again immediately on the next tick. Roll the cooldown
+  // here so it's stable across ticks (vs. re-rolling and getting lucky/
+  // unlucky on each one).
+  const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+  nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
 
   try {
     await client.createTweet({
@@ -136,8 +172,34 @@ async function runSearchPhase(client, campaign, cfg) {
     }
     await sleep(800 + Math.random() * 800);
   }
-  // Filter
-  return all.filter((t) => passesFilters(t, cfg.filters)).filter((t) => !db.isSent(campaign.id, t.id));
+
+  // Filter — track drops for diagnostics. If a non-trivial fraction of
+  // tweets is dropped solely for missing authorHandle, that's our canary
+  // for X having silently changed the user-result shape again. See
+  // x/client.js extractTweets() for the resolution logic. Without this
+  // count the symptom would just be "search → 0 usable" on every cycle.
+  let droppedNoHandle = 0;
+  const passed = [];
+  for (const t of all) {
+    if (!t || !t.id || !t.text) continue;
+    if (!t.authorHandle) { droppedNoHandle++; continue; }
+    if (!passesFilters(t, cfg.filters)) continue;
+    if (db.isSent(campaign.id, t.id)) continue;
+    passed.push(t);
+  }
+  if (droppedNoHandle > 0 && all.length > 0) {
+    const pct = Math.round((droppedNoHandle / all.length) * 100);
+    // Above ~30% suggests a shape change rather than a long-tail of
+    // protected/anonymous accounts. Surface as WARN so it shows up in
+    // /logs and `docker logs --tail` without grepping.
+    const fn = pct > 30 ? 'warn' : 'info';
+    logger[fn](
+      'runner',
+      `c${campaign.id} dropped ${droppedNoHandle}/${all.length} tweets with no handle (${pct}%)`,
+      campaign.id,
+    );
+  }
+  return passed;
 }
 
 function passesFilters(t, f) {
@@ -172,9 +234,6 @@ function passesFilters(t, f) {
 
 function pickTemplate(templates) {
   return templates[Math.floor(Math.random() * templates.length)];
-}
-function renderTemplate(tpl, ctx) {
-  return tpl.replace(/\{(\w+)\}/g, (_, k) => (ctx[k] != null ? String(ctx[k]) : ''));
 }
 
 // Log-normal jitter: most pauses short, occasional long ones (human-shaped).
