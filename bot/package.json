@@ -14,9 +14,7 @@
   "dependencies": {
     "better-sqlite3": "^11.5.0",
     "dotenv": "^16.4.5",
-    "node-telegram-bot-api": "^0.66.0"
-  },
-  "optionalDependencies": {
-    "node-tls-client": "^1.2.6"
+    "node-telegram-bot-api": "^0.66.0",
+    "node-tls-client": "^1.6.4"
   }
 }

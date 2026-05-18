@@ -1,17 +1,28 @@
 // X.com HTTP client.
 //
-// Two transports, picked at startup:
-//   1. node-tls-client (preferred) — wraps bogdanfinn's Go library. Produces
-//      a Chrome-shaped TLS Client Hello (JA3 + extension order + HTTP/2
-//      SETTINGS frame). This is what your prior project used (curl_cffi in
-//      Python). X.com's WAF reads the TLS fingerprint at handshake time, so
-//      "vanilla Node fetch" is not enough on its own.
-//   2. Native Node fetch (fallback) — used if node-tls-client failed to
-//      install (Go binary download blocked, unsupported arch, etc.). It
-//      will probably 404 on x.com, but the rest of the bot still runs and
-//      a clear log line tells you why.
+// Two transports, picked at runtime:
 //
-// Each XClient instance corresponds to ONE X account (one set of cookies).
+//   1. node-tls-client (preferred). Uses koffi to load Bogdanfinn's
+//      tls-client shared library, which produces a Chrome-shaped TLS
+//      Client Hello — JA3 fingerprint, HTTP/2 SETTINGS frame, header
+//      order — that X.com's WAF accepts. This is the same approach the
+//      prior project used (curl_cffi in Python).
+//
+//   2. Native Node fetch (fallback). Used only if node-tls-client failed
+//      to import (rare; typically only happens when the package was
+//      deliberately omitted from install). It will probably 404 on X
+//      because Node's TLS handshake is recognised by Cloudflare-style
+//      WAFs, but we don't crash — we log loudly and keep the bot alive
+//      so other features (Telegram control, /stats, /logs) still work.
+//
+// API notes (these tripped me up — read before editing):
+//   * Session is constructed with `new Session({ clientIdentifier, ... })`.
+//   * Per-request cookies go in the `cookies` option as a flat
+//     `Record<string,string>`. Do NOT touch the underlying tough-cookie
+//     jar directly; the library manages it.
+//   * `session.get`, `session.post` etc. return a Response with .ok,
+//     .status, .body (already a string), .json(), .text().
+//   * `execute()` is protected — call the verb methods.
 import { logger } from '../core/logger.js';
 
 const PUBLIC_BEARER =
@@ -21,6 +32,7 @@ const PUBLIC_BEARER =
 const HOMEPAGE = 'https://x.com/home';
 const GQL_BASE = 'https://x.com/i/api/graphql';
 
+// Module-scoped: resolves once on first call. Subsequent constructors reuse.
 let TlsSession = null;
 let tlsTried = false;
 async function getTlsSession() {
@@ -28,17 +40,28 @@ async function getTlsSession() {
   tlsTried = true;
   try {
     const mod = await import('node-tls-client');
-    TlsSession = mod.Session || mod.default?.Session;
-    if (TlsSession) logger.info('xclient', 'using node-tls-client (Chrome TLS fingerprint)');
-    else logger.warn('xclient', 'node-tls-client present but Session not exported; using fetch');
+    TlsSession = mod.Session || (mod.default && mod.default.Session);
+    if (TlsSession) {
+      logger.info('xclient', 'using node-tls-client (Chrome TLS fingerprint)');
+    } else {
+      logger.warn('xclient', 'node-tls-client present but Session export missing; using vanilla fetch');
+    }
   } catch (e) {
-    logger.warn('xclient', `node-tls-client not installed (${e.code || e.message}); using vanilla fetch — X may 404`);
+    logger.warn(
+      'xclient',
+      `node-tls-client not installed (${e.code || e.message}); ` +
+      `using vanilla fetch — X will probably return 404`,
+    );
     TlsSession = null;
   }
   return TlsSession;
 }
 
-function chromeHeaders({ ct0, lang = 'en', isPost = false }) {
+// Chrome's actual header set + order. Order doesn't strictly matter when we
+// hand a plain object to node-tls-client (it has its own ordering machinery),
+// but we keep the "natural" Chrome order so vanilla-fetch fallback is at
+// least less obviously a bot.
+function chromeHeaders({ lang = 'en', isPost = false }) {
   const h = {
     'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
@@ -47,7 +70,6 @@ function chromeHeaders({ ct0, lang = 'en', isPost = false }) {
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
     'authorization': PUBLIC_BEARER,
-    'x-csrf-token': ct0,
     'x-twitter-active-user': 'yes',
     'x-twitter-auth-type': 'OAuth2Session',
     'x-twitter-client-language': lang,
@@ -68,44 +90,57 @@ export class XClient {
     this.secrets = secrets;
     this.proxy = proxy;
     this.lang = lang;
-    this._tls = null;
+    this._session = null;
+    this._sessionInited = false;
   }
 
-  async _ensureTls() {
-    if (this._tls !== null) return;
+  async _ensureSession() {
+    if (this._sessionInited) return;
+    this._sessionInited = true;
     const Session = await getTlsSession();
-    if (!Session) { this._tls = false; return; }
-    this._tls = new Session({
+    if (!Session) { this._session = null; return; }
+    this._session = new Session({
       clientIdentifier: 'chrome_124',
+      // Random TLS extension order: more important on actively-policed WAFs
+      // than X, but cheap to enable.
       randomTlsExtensionOrder: true,
-      ...(this.proxy ? { proxies: { http: this.proxy, https: this.proxy } } : {}),
+      // Default 30s — enough for slow X queries, short enough for backoff.
+      timeout: 30_000,
+      ...(this.proxy ? { proxy: this.proxy } : {}),
     });
-    // Seed cookies on the session.
-    const cookieHeader = `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`;
-    this._cookieHeader = cookieHeader;
   }
 
+  // Both transports return the same shape: { status:number, text:string }.
   async _request(method, url, { body = null } = {}) {
-    await this._ensureTls();
-    const headers = chromeHeaders({
-      ct0: this.secrets.ct0, lang: this.lang, isPost: body !== null,
-    });
+    await this._ensureSession();
+    const isPost = body !== null;
+    const headers = chromeHeaders({ lang: this.lang, isPost });
+    // X reads CSRF from the x-csrf-token header AND from the ct0 cookie.
+    // Both must match; we pass the live cookie value in both places.
+    headers['x-csrf-token'] = this.secrets.ct0;
 
-    if (this._tls) {
-      // node-tls-client API
-      headers['cookie'] = this._cookieHeader;
-      const opts = { headers };
-      if (body !== null) opts.body = JSON.stringify(body);
-      const resp = await this._tls.execute(method, url, opts);
-      const text = typeof resp.body === 'string' ? resp.body : (resp.body ? String(resp.body) : '');
-      return { status: resp.status, text };
+    const cookies = {
+      auth_token: this.secrets.auth_token,
+      ct0: this.secrets.ct0,
+    };
+
+    if (this._session) {
+      const opts = { headers, cookies };
+      if (isPost) opts.body = JSON.stringify(body);
+      let resp;
+      if (method === 'GET') resp = await this._session.get(url, opts);
+      else if (method === 'POST') resp = await this._session.post(url, opts);
+      else throw new Error(`unsupported method ${method}`);
+      return { status: resp.status, text: resp.body || '' };
     }
 
-    // Vanilla fetch fallback. Will likely 404 but at least gives a clear
-    // signal in logs.
-    headers['cookie'] = `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`;
-    const opts = { method, headers, redirect: 'follow' };
-    if (body !== null) opts.body = JSON.stringify(body);
+    // Fallback: native fetch. Almost certainly 404 on X but keeps the bot alive.
+    const fetchHeaders = {
+      ...headers,
+      cookie: `auth_token=${this.secrets.auth_token}; ct0=${this.secrets.ct0}`,
+    };
+    const opts = { method, headers: fetchHeaders, redirect: 'follow' };
+    if (isPost) opts.body = JSON.stringify(body);
     const r = await fetch(url, opts);
     const text = await r.text();
     return { status: r.status, text };
@@ -122,13 +157,17 @@ export class XClient {
 
   async searchTimeline({ capturedOp, query }) {
     if (!capturedOp || !capturedOp.url) {
-      throw new Error('SearchTimeline shape not available. Paste from extension into bot/data/captured-ops.json.');
+      throw new Error(
+        'SearchTimeline shape not available. Paste from extension into bot/data/captured-ops.json.',
+      );
     }
     const u = new URL(capturedOp.url);
     let baseVars = {};
     try {
       baseVars = JSON.parse(u.searchParams.get('variables') || '{}');
-    } catch {}
+    } catch { /* leave empty */ }
+    // Strip pagination state but keep querySource/product as-is — X's
+    // queryId is bound to the exact variable shape it was observed with.
     delete baseVars.cursor;
     delete baseVars.referrer;
     delete baseVars.controller_data;
@@ -140,7 +179,7 @@ export class XClient {
 
     const r = await this._request('GET', u.toString());
     if (r.status !== 200) {
-      const err = new Error(`SearchTimeline HTTP ${r.status}: ${r.text.slice(0, 200)}`);
+      const err = new Error(`SearchTimeline HTTP ${r.status}: ${(r.text || '').slice(0, 200)}`);
       err.status = r.status;
       throw err;
     }
@@ -149,7 +188,9 @@ export class XClient {
 
   async createTweet({ capturedOp, text, replyToTweetId }) {
     if (!capturedOp || !capturedOp.queryId) {
-      throw new Error('CreateTweet shape not available. Paste from extension into bot/data/captured-ops.json.');
+      throw new Error(
+        'CreateTweet shape not available. Paste from extension into bot/data/captured-ops.json.',
+      );
     }
     const baseBody = capturedOp.body ? JSON.parse(capturedOp.body) : {};
     const baseVars = baseBody.variables || {};
@@ -168,13 +209,15 @@ export class XClient {
     } else {
       delete variables.reply;
     }
-    const features = baseBody.features || (capturedOp.features ? JSON.parse(capturedOp.features) : {});
+    const features =
+      baseBody.features ||
+      (capturedOp.features ? JSON.parse(capturedOp.features) : {});
     const body = { ...baseBody, variables, features, queryId: capturedOp.queryId };
 
     const url = capturedOp.url || `${GQL_BASE}/${capturedOp.queryId}/CreateTweet`;
     const r = await this._request('POST', url, { body });
     if (r.status !== 200) {
-      const err = new Error(`CreateTweet HTTP ${r.status}: ${r.text.slice(0, 200)}`);
+      const err = new Error(`CreateTweet HTTP ${r.status}: ${(r.text || '').slice(0, 200)}`);
       err.status = r.status;
       throw err;
     }
@@ -182,6 +225,7 @@ export class XClient {
   }
 }
 
+// Walks a deeply-nested X response and collects top-level tweet results.
 function extractTweets(data) {
   const out = [];
   const seen = new Set();

@@ -15,12 +15,16 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-COPY package.json package-lock.json* ./
+# Only the manifest — we deliberately ignore any host-generated
+# package-lock.json (.dockerignore'd) so the install resolves fresh against
+# the current platform, avoiding stale-lock skips of native dependencies.
+COPY package.json ./
 
-# Force install of node-tls-client (it's listed as optional in package.json so
-# npm can skip it on unsupported platforms — here we know it works).
-RUN npm install --omit=dev || npm install \
- && npm install node-tls-client --foreground-scripts
+# Foreground scripts so we see the node-tls-client postinstall download.
+# Then assert the native binary is actually on disk — fail the build loud
+# if it isn't, instead of silently shipping a broken image.
+RUN npm install --foreground-scripts \
+ && node -e "import('node-tls-client').then(m => { if (!m.Session && !(m.default && m.default.Session)) { throw new Error('node-tls-client loaded but Session export missing'); } console.log('node-tls-client OK, version', require('node-tls-client/package.json').version); })"
 
 COPY src ./src
 
