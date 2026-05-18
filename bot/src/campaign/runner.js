@@ -103,9 +103,11 @@ export async function tickCampaign(campaign) {
     });
     db.markSent(campaign.id, t.id);
     db.bumpCampaignAction(campaign.id, 'reply');
-    logger.info('runner', `c${campaign.id} replied to @${t.authorHandle} (${t.id})`, campaign.id);
+    const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
+    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})`, campaign.id);
   } catch (e) {
-    logger.error('runner', `c${campaign.id} reply ${t.id}: ${e.message}`, campaign.id);
+    const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
+    logger.error('runner', `c${campaign.id} reply ${t.id} (${who}): ${e.message}`, campaign.id);
     db.markSent(campaign.id, t.id); // don't retry the same broken tweet
     if (e.status === 401 || e.status === 403 || e.status === 429) {
       db.setCampaignStatus(campaign.id, 'error', e.message);
@@ -140,6 +142,11 @@ async function runSearchPhase(client, campaign, cfg) {
 
 function passesFilters(t, f) {
   if (!t || !t.id || !t.text) return false;
+  // Drop tweets where we couldn't resolve the author. With no handle the
+  // template can't render `@{author}` and the log line becomes "@null …",
+  // which is what was happening before extractTweets handled the new
+  // result.core.screen_name shape. Cheap belt-and-suspenders.
+  if (!t.authorHandle) return false;
   if (f.skipReplies && t.isReply) return false;
   if (f.skipRetweets && t.isRetweet) return false;
   if (f.skipQuotes && t.isQuote) return false;

@@ -274,16 +274,30 @@ function extractTweets(data) {
     const id = node.rest_id;
     if (tw && id && typeof tw.full_text === 'string' && !seen.has(id)) {
       seen.add(id);
-      // User data can be nested in several places depending on the response shape
-      const u =
-        node.core?.user_results?.result?.legacy ||
+      // Resolve author from any of the shapes X has used.
+      // Pre-2024: result.legacy.{screen_name,name,followers_count}
+      // 2024+:    result.core.{screen_name,name} (legacy is being deprecated)
+      // Quoted/retweeted tweets nest one extra `tweet.` level.
+      const userResult =
         node.core?.user_results?.result ||
-        node.tweet?.core?.user_results?.result?.legacy ||
         node.tweet?.core?.user_results?.result ||
         null;
-      // Sometimes legacy is one level deeper
-      const uLegacy = u?.legacy || u;
-      const uResult = node.core?.user_results?.result || node.tweet?.core?.user_results?.result;
+      const u = userResult?.legacy || null;
+      const uCore = userResult?.core || null;
+      const handle =
+        u?.screen_name ||
+        uCore?.screen_name ||
+        userResult?.screen_name ||
+        null;
+      const name =
+        u?.name ||
+        uCore?.name ||
+        userResult?.name ||
+        null;
+      const followers =
+        u?.followers_count ||
+        userResult?.followers_count ||
+        0;
       out.push({
         id,
         text: tw.full_text,
@@ -296,9 +310,9 @@ function extractTweets(data) {
         isRetweet: !!tw.retweeted_status_result,
         isQuote: !!tw.is_quote_status,
         hasUrls: !!(tw.entities?.urls?.length),
-        authorHandle: uLegacy?.screen_name || uResult?.legacy?.screen_name || null,
-        authorName: uLegacy?.name || uResult?.legacy?.name || null,
-        authorFollowers: uLegacy?.followers_count || uResult?.legacy?.followers_count || 0,
+        authorHandle: handle,
+        authorName: name,
+        authorFollowers: followers,
       });
     }
     for (const k of Object.keys(node)) stack.push(node[k]);
