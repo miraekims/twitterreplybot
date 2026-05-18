@@ -20,20 +20,20 @@ RUN apt-get update \
 # the current platform, avoiding stale-lock skips of native dependencies.
 COPY package.json ./
 
-# Foreground scripts so we see the install steps. Then run a tiny self-test
-# script that imports node-tls-client AND calls initTLS() — this forces koffi
-# to actually load the native library, which is the part that silently fails
-# when the library is missing or platform-incompatible.
-RUN npm install --foreground-scripts
-COPY <<'EOF' /tmp/tls-selftest.mjs
-import { Session, initTLS, destroyTLS } from 'node-tls-client';
-await initTLS();
-const s = new Session({ clientIdentifier: 'chrome_124', timeout: 5000 });
-await s.close();
-await destroyTLS();
-console.log('node-tls-client native library loaded OK');
-EOF
-RUN node /tmp/tls-selftest.mjs && rm /tmp/tls-selftest.mjs
+# Install. Foreground scripts so we see the postinstall output. After install
+# we dump the resolved tree and the package directory contents — if anything
+# is missing, the diff is right there in the build log.
+RUN npm install --foreground-scripts \
+ && echo "--- npm ls (top-level) ---" \
+ && npm ls --depth=0 \
+ && echo "--- node_modules/node-tls-client ---" \
+ && ls -la node_modules/node-tls-client/ \
+ && node -e 'const p=require("./node_modules/node-tls-client/package.json"); console.log("RESOLVED:",p.name,"v"+p.version,"main="+p.main)'
+
+# Self-test runs from /app so module resolution finds node_modules. Imports
+# the package, calls initTLS() to force native library load, opens and
+# closes a Session, then destroyTLS. Build fails loud if any step throws.
+RUN node -e 'import("node-tls-client").then(async m=>{await m.initTLS();const s=new m.Session({clientIdentifier:"chrome_124",timeout:5000});await s.close();await m.destroyTLS();console.log("TLS native lib OK")}).catch(e=>{console.error("SELFTEST FAIL:",e&&e.stack||e);process.exit(1)})'
 
 COPY src ./src
 
