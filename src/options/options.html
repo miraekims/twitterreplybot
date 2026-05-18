@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>X Reply Bot — Options</title>
+    <style>
+      body { font: 13px -apple-system, sans-serif; padding: 16px; max-width: 560px; }
+      label { display: block; margin: 12px 0 4px; font-weight: 600; }
+      input { width: 100%; padding: 6px 8px; box-sizing: border-box; font: inherit; }
+      button { margin-top: 14px; padding: 8px 14px; font: inherit; cursor: pointer; }
+      .status { margin-top: 14px; padding: 10px; border-radius: 6px; background: #f4f4f4; }
+      .ok { color: #0a7d2c; }
+      .bad { color: #b3261e; }
+      .hint { color: #666; font-size: 12px; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <h2>Bot bridge</h2>
+    <p>The Chrome extension talks to the Docker bot over a local WebSocket.
+       Both must agree on a URL and a shared token.</p>
+
+    <label for="url">Bridge URL</label>
+    <input id="url" type="text" />
+    <div class="hint">Default: <code>ws://host.docker.internal:8787</code> (Docker Desktop on Mac/Win).
+       On Linux without Desktop, use <code>ws://172.17.0.1:8787</code> or expose via host network.</div>
+
+    <label for="token">Shared token</label>
+    <input id="token" type="text" autocomplete="off" />
+    <div class="hint">Must match <code>XBOT_BRIDGE_TOKEN</code> in <code>bot/.env</code>.</div>
+
+    <button id="save">Save & reconnect</button>
+
+    <div class="status" id="status">Loading…</div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

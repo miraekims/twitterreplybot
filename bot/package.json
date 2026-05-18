@@ -1,7 +1,7 @@
 {
   "name": "x-reply-bot",
-  "version": "0.1.0",
-  "description": "Standalone X.com auto-reply bot, controlled from Telegram. No browser required.",
+  "version": "0.2.0",
+  "description": "X.com auto-reply bot. Telegram UI + scheduling, Chrome extension does the actual HTTP via local WebSocket bridge.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -15,6 +15,6 @@
     "better-sqlite3": "^11.5.0",
     "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.66.0",
-    "xclienttransaction": "^0.0.2"
+    "ws": "^8.18.0"
   }
 }

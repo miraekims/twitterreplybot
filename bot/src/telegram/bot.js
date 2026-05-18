@@ -1,28 +1,35 @@
 // Telegram control surface. Long-poll, no webhooks → works behind any NAT.
 //
-// Commands (only allowed users from TELEGRAM_ALLOWED_USERS can use them):
+// Commands:
 //   /start            — short help
-//   /accounts         — list connected X accounts
-//   /connect          — guides through pasting auth_token + ct0
-//   /disconnect <id>  — remove an account
+//   /accounts         — list connected X account (just one with the bridge model)
+//   /connect          — wait for Chrome extension to register
+//   /disconnect       — forget the registered account (Chrome session stays
+//                       intact; this only removes the row in our DB)
 //   /campaigns        — list campaigns
-//   /new <account_id> — interactive campaign creation
-//   /run <id>         — start campaign
-//   /pause <id>       — pause
-//   /stop <id>        — stop & clear queue (keeps config)
-//   /stats <id>       — counters & last error
-//   /logs <id>        — last 30 log lines
+//   /new              — interactive campaign creation (no account_id needed —
+//                       there's only ever one)
+//   /run <id>, /pause <id>, /stop <id>
+//   /stats <id>, /logs <id>, /preset <id> <name>
+//
+// Identity model with the bridge:
+//   - The Chrome extension authenticates to the bot bridge (shared token in
+//     .env). On connect it tells us which @handle is logged in.
+//   - We persist a single account row per handle, no secrets — Chrome owns
+//     them. When Chrome reconnects under a different handle, we add another
+//     row, but only one is "active" (whichever Chrome currently broadcasts).
+//   - Campaigns reference account_id like before, so old DB rows still work.
 import TelegramBot from 'node-telegram-bot-api';
 import { db } from '../core/db.js';
-import { encryptJSON } from '../core/crypto.js';
 import { logger } from '../core/logger.js';
 import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS } from '../campaign/defaults.js';
 import { aiActivationSummary } from '../persona/persona.js';
-
-const PASSPHRASE = process.env.ENCRYPTION_PASSPHRASE;
+import { bridge } from '../bridge/server.js';
 
 let bot;
 const conversations = new Map(); // chatId → { kind, step, draft }
+// Pending /connect waiters: chatId → { tgUserId, timeoutHandle }
+const connectWaiters = new Map();
 
 function allowed(userId) {
   const list = (process.env.TELEGRAM_ALLOWED_USERS || '')
@@ -38,9 +45,9 @@ export function startTelegram() {
   bot.onText(/^\/help$/, (m) => guard(m, () => bot.sendMessage(m.chat.id, HELP)));
   bot.onText(/^\/accounts$/, (m) => guard(m, () => cmdAccounts(m)));
   bot.onText(/^\/connect$/, (m) => guard(m, () => cmdConnect(m)));
-  bot.onText(/^\/disconnect\s+(\d+)/, (m, mt) => guard(m, () => cmdDisconnect(m, +mt[1])));
+  bot.onText(/^\/disconnect(?:\s+(\d+))?/, (m, mt) => guard(m, () => cmdDisconnect(m, mt[1] && +mt[1])));
   bot.onText(/^\/campaigns$/, (m) => guard(m, () => cmdCampaigns(m)));
-  bot.onText(/^\/new\s+(\d+)/, (m, mt) => guard(m, () => cmdNew(m, +mt[1])));
+  bot.onText(/^\/new(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdNew(m, mt[1] && +mt[1])));
   bot.onText(/^\/run\s+(\d+)/, (m, mt) => guard(m, () => cmdRun(m, +mt[1])));
   bot.onText(/^\/pause\s+(\d+)/, (m, mt) => guard(m, () => cmdSetStatus(m, +mt[1], 'paused')));
   bot.onText(/^\/stop\s+(\d+)/, (m, mt) => guard(m, () => cmdSetStatus(m, +mt[1], 'idle')));
@@ -48,6 +55,30 @@ export function startTelegram() {
   bot.onText(/^\/logs\s+(\d+)/, (m, mt) => guard(m, () => cmdLogs(m, +mt[1])));
   bot.onText(/^\/preset(?:\s+(\d+)\s+(\w+))?/, (m, mt) => guard(m, () => cmdPreset(m, mt[1] && +mt[1], mt[2])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
+
+  // Resolve any pending /connect waiter the moment the extension hellos.
+  bridge.onConnect(async (status) => {
+    for (const [chatId, w] of connectWaiters) {
+      clearTimeout(w.timeoutHandle);
+      try {
+        const accountId = ensureAccountForHandle(w.tgUserId, status.handle);
+        await bot.sendMessage(
+          chatId,
+          `✓ Extension connected: @${status.handle || '?'} (v${status.extVersion || '?'})\n` +
+          `Account #${accountId} ready. Use /new to create a campaign.`,
+        );
+      } catch (e) {
+        await bot.sendMessage(chatId, `Extension connected but DB error: ${e.message}`);
+      }
+      connectWaiters.delete(chatId);
+    }
+  });
+
+  bridge.onDisconnect((info) => {
+    // Surface disconnects to anyone in /connect waiting state too — they
+    // were probably watching anyway.
+    logger.warn('tg', `extension disconnected: @${info.handle || '?'}`);
+  });
 
   logger.info('tg', 'telegram bot started (long-poll)');
 }
@@ -63,49 +94,118 @@ function guard(msg, fn) {
 const HELP = [
   'X Reply Bot',
   '',
-  '/connect — add an X account (auth_token + ct0)',
-  '/accounts — list accounts',
-  '/new <account_id> — create a campaign (keywords + templates)',
+  '/connect — wait for the Chrome extension to attach',
+  '/accounts — list connected X account(s)',
+  '/new — create a campaign (keywords + templates + persona)',
   '/campaigns — list campaigns',
   '/run <id>, /pause <id>, /stop <id>',
   '/stats <id>, /logs <id>',
   '/preset <id> <safe|medium|highvolume> — swap pacing profile',
-  '/disconnect <account_id>',
+  '/disconnect [id] — forget account row (Chrome session itself stays)',
 ].join('\n');
 
 // ---------- accounts ----------
+function ensureAccountForHandle(owner_tg, handle) {
+  // Look up an existing row by handle for this user; if not found, insert
+  // a new one with empty secrets_blob (we don't have or need them anymore).
+  const list = db.listAccounts(owner_tg);
+  const existing = list.find((a) => a.handle === handle);
+  if (existing) return existing.id;
+  return db.insertAccount({
+    owner_tg,
+    handle,
+    secrets_blob: '', // intentionally empty — Chrome owns the session now
+  });
+}
+
 function cmdAccounts(msg) {
   const list = db.listAccounts(msg.from.id);
-  if (!list.length) return bot.sendMessage(msg.chat.id, 'No accounts. Use /connect.');
-  const rows = list.map((a) => `#${a.id} @${a.handle || '?'}  ${a.last_error ? '⚠ ' + a.last_error : ''}`);
-  bot.sendMessage(msg.chat.id, rows.join('\n'));
+  const status = bridge.status();
+  const lines = list.length
+    ? list.map((a) => {
+        const live = status.connected && status.handle === a.handle ? ' (live)' : '';
+        return `#${a.id} @${a.handle || '?'}${live}${a.last_error ? '  ⚠ ' + a.last_error : ''}`;
+      })
+    : ['(none yet — use /connect)'];
+  const bridgeLine = status.connected
+    ? `Bridge: ✓ connected as @${status.handle} (v${status.extVersion || '?'})`
+    : 'Bridge: ✗ not connected — open Chrome with the extension on x.com';
+  bot.sendMessage(msg.chat.id, `${bridgeLine}\n\n${lines.join('\n')}`);
 }
 
 function cmdConnect(msg) {
-  conversations.set(msg.chat.id, { kind: 'connect', step: 'handle', draft: { owner_tg: msg.from.id } });
-  bot.sendMessage(msg.chat.id,
-    'Connect X account. I will ask for handle, auth_token, ct0.\n' +
-    'How to get cookies: x.com → F12 → Application → Cookies → x.com → ' +
-    'copy auth_token and ct0 values.\n\nWhat is the @handle?');
+  const status = bridge.status();
+  if (status.connected) {
+    const accountId = ensureAccountForHandle(msg.from.id, status.handle);
+    return bot.sendMessage(
+      msg.chat.id,
+      `✓ Extension already connected: @${status.handle}\n` +
+      `Account #${accountId} ready. Use /new to create a campaign.`,
+    );
+  }
+  // Wait up to 90 sec for the extension to hello.
+  const timeoutHandle = setTimeout(() => {
+    if (connectWaiters.has(msg.chat.id)) {
+      connectWaiters.delete(msg.chat.id);
+      bot.sendMessage(
+        msg.chat.id,
+        '⏱ Timed out waiting for extension.\n\n' +
+        'Checklist:\n' +
+        ' • Chrome is running on this Mac\n' +
+        ' • You are logged into x.com in some tab\n' +
+        ' • The X Reply Bot extension is enabled (chrome://extensions)\n' +
+        ' • In the extension options, the bridge URL is `ws://host.docker.internal:8787`\n' +
+        '   and the token matches XBOT_BRIDGE_TOKEN in bot/.env',
+      );
+    }
+  }, 90 * 1000);
+  connectWaiters.set(msg.chat.id, { tgUserId: msg.from.id, timeoutHandle });
+  bot.sendMessage(
+    msg.chat.id,
+    'Waiting for Chrome extension to attach...\n\n' +
+    'Open Chrome → make sure you are logged into x.com → extension auto-connects.\n' +
+    'I will reply here as soon as it does (or after 90s if it doesn\'t).',
+  );
 }
 
 function cmdDisconnect(msg, id) {
+  const list = db.listAccounts(msg.from.id);
+  if (!list.length) return bot.sendMessage(msg.chat.id, 'No account rows to remove.');
+  // Single-account default: if no id given and only one row exists, drop that one.
+  if (id == null) {
+    if (list.length === 1) id = list[0].id;
+    else return bot.sendMessage(msg.chat.id,
+      'Multiple account rows. Use /disconnect <id>:\n' + list.map((a) => `  ${a.id} @${a.handle}`).join('\n'));
+  }
   const a = db.getAccount(id);
   if (!a || a.owner_tg !== msg.from.id) return bot.sendMessage(msg.chat.id, 'Not your account.');
   db.deleteAccount(id);
-  bot.sendMessage(msg.chat.id, `Account #${id} removed.`);
+  bot.sendMessage(msg.chat.id,
+    `Account #${id} removed from DB.\n` +
+    `(The Chrome session itself is untouched — log out in Chrome too if you want a clean slate.)`);
 }
 
 // ---------- campaigns ----------
 function cmdCampaigns(msg) {
   const list = db.listCampaigns(msg.from.id);
-  if (!list.length) return bot.sendMessage(msg.chat.id, 'No campaigns. Use /new <account_id>.');
+  if (!list.length) return bot.sendMessage(msg.chat.id, 'No campaigns. Use /new.');
   bot.sendMessage(msg.chat.id, list.map((c) =>
     `#${c.id} "${c.name}" → ${c.status}, sent: ${c.sent_total}${c.last_error ? ' ⚠ ' + c.last_error : ''}`
   ).join('\n'));
 }
 
 function cmdNew(msg, account_id) {
+  // /new without an id: pick the user's only account (or fall back to a
+  // helpful error if there's a tie). With the bridge model, a user almost
+  // always has exactly one row anyway.
+  const owned = db.listAccounts(msg.from.id);
+  if (account_id == null) {
+    if (!owned.length) return bot.sendMessage(msg.chat.id,
+      'No connected accounts. Use /connect first to attach the Chrome extension.');
+    if (owned.length > 1) return bot.sendMessage(msg.chat.id,
+      'Multiple accounts. Specify which:\n/new ' + owned.map((a) => `${a.id} (@${a.handle})`).join('\n/new '));
+    account_id = owned[0].id;
+  }
   const a = db.getAccount(account_id);
   if (!a || a.owner_tg !== msg.from.id) return bot.sendMessage(msg.chat.id, 'Not your account.');
   conversations.set(msg.chat.id, {
@@ -113,12 +213,17 @@ function cmdNew(msg, account_id) {
     step: 'name',
     draft: { account_id, config: defaultCampaignConfig() },
   });
-  bot.sendMessage(msg.chat.id, 'Campaign name?');
+  bot.sendMessage(msg.chat.id, `Creating campaign for @${a.handle || '?'}.\nCampaign name?`);
 }
 
 function cmdRun(msg, id) {
   const c = db.getCampaign(id);
   if (!c) return bot.sendMessage(msg.chat.id, 'No such campaign.');
+  if (!bridge.isConnected()) {
+    return bot.sendMessage(msg.chat.id,
+      '⚠ Bridge not connected. Campaign will idle until Chrome extension attaches.\n' +
+      'Use /connect to wait for it, or just start Chrome — the campaign will pick up automatically.');
+  }
   db.setCampaignStatus(id, 'running');
   bot.sendMessage(msg.chat.id, `▶ campaign #${id} running`);
 }
@@ -139,14 +244,46 @@ function cmdStats(msg, id) {
   const personaLabel = cfg?.persona?.name
     ? `${cfg.persona.name}${cfg.persona.style ? ` (${cfg.persona.style.slice(0, 40)})` : ''}`
     : '(neutral default)';
+  const bs = bridge.status();
+  const bridgeLine = bs.connected
+    ? `Bridge: ✓ @${bs.handle} (last pong ${ageSec(bs.lastPongAt)}s ago)`
+    : 'Bridge: ✗ disconnected';
+  const opLine = bs.opSummary
+    ? `Last op refresh: ${freshestOpAge(bs.opSummary)}`
+    : 'Last op refresh: unknown';
   bot.sendMessage(msg.chat.id,
     `#${id} "${c.name}" — ${c.status}\n` +
     `Sent total: ${c.sent_total}, last hour: ${lastHour}\n` +
     `Cap: ${cap}/h (~${dailyEst}/day with current sleep window)\n` +
     `AI: ${aiActivationSummary()}\n` +
     `Persona: ${personaLabel}\n` +
+    `${bridgeLine}\n` +
+    `${opLine}\n` +
     `Last action: ${c.last_action_at ? new Date(c.last_action_at).toISOString() : 'never'}\n` +
     (c.last_error ? `⚠ ${c.last_error}` : ''));
+}
+
+function ageSec(ts) {
+  if (!ts) return '?';
+  return Math.max(0, Math.round((Date.now() - ts) / 1000));
+}
+
+function freshestOpAge(opSummary) {
+  if (!opSummary || typeof opSummary !== 'object') return 'unknown';
+  // The extension sends { OpName: { lastSeen, queryId } }. The "freshest"
+  // operation is the one we last observed live on the page — closest proxy
+  // to "is the user actively browsing x.com / are headers fresh".
+  let newest = 0;
+  let newestName = null;
+  for (const [name, info] of Object.entries(opSummary)) {
+    if (info?.lastSeen && info.lastSeen > newest) {
+      newest = info.lastSeen;
+      newestName = name;
+    }
+  }
+  if (!newest) return 'never';
+  const minutesAgo = Math.round((Date.now() - newest) / 60000);
+  return `${newestName} ${minutesAgo} min ago`;
 }
 
 function cmdPreset(msg, id, name) {
@@ -198,39 +335,7 @@ function handleConversation(msg) {
   if (!msg.text || msg.text.startsWith('/')) return;
   const conv = conversations.get(msg.chat.id);
   if (!conv) return;
-
-  if (conv.kind === 'connect') return stepConnect(msg, conv);
   if (conv.kind === 'newCampaign') return stepNewCampaign(msg, conv);
-}
-
-function stepConnect(msg, conv) {
-  const text = msg.text.trim();
-  if (conv.step === 'handle') {
-    conv.draft.handle = text.replace(/^@/, '');
-    conv.step = 'auth_token';
-    return bot.sendMessage(msg.chat.id, 'Now paste auth_token (long hex string from cookies).');
-  }
-  if (conv.step === 'auth_token') {
-    conv.draft.auth_token = text;
-    conv.step = 'ct0';
-    return bot.sendMessage(msg.chat.id, 'Now paste ct0.');
-  }
-  if (conv.step === 'ct0') {
-    conv.draft.ct0 = text;
-    const blob = encryptJSON(PASSPHRASE, {
-      auth_token: conv.draft.auth_token,
-      ct0: conv.draft.ct0,
-    });
-    const id = db.insertAccount({
-      owner_tg: conv.draft.owner_tg,
-      handle: conv.draft.handle,
-      secrets_blob: blob,
-    });
-    conversations.delete(msg.chat.id);
-    return bot.sendMessage(msg.chat.id,
-      `✓ Account #${id} @${conv.draft.handle} stored (encrypted).\n` +
-      `Use /new ${id} to create a campaign.`);
-  }
 }
 
 function stepNewCampaign(msg, conv) {

@@ -1,4 +1,11 @@
-// Service worker — message router.
+// Service worker — message router + bot bridge client + watchdog.
+//
+// Two ingress channels:
+//   1. chrome.runtime.onMessage — the modal UI and content scripts
+//      (capture.observe, auto.start, debug.testSearch, ...)
+//   2. WebSocket from the bot — the new bridge. The bot drives all
+//      production traffic through here. Routed through the same
+//      handlers map as channel 1.
 import { recordObservation, getAllOps, getHeaders } from './query-registry.js';
 import { tweetDetail, createTweet, searchTimeline } from './x-api.js';
 import {
@@ -6,17 +13,24 @@ import {
   start as autoStart, stop as autoStop, resetSent,
   registerAlarmHandler,
 } from '../core/auto-runner.js';
+import {
+  startBridge, getBridgeStatus, getBridgeSettings, setBridgeSettings,
+} from './bridge-client.js';
+import { registerKeepalive } from './keepalive.js';
 
-// Bumped on every code-meaningful change. The UI surfaces this so we can
-// instantly tell whether the running SW is actually the latest one
-// (chrome.tabs F5 does NOT reload the SW; only chrome://extensions Reload does).
-const EXT_VERSION = '0.4.0';
+const EXT_VERSION = chrome.runtime.getManifest().version;
 console.log(`[xbot] service worker booted, version ${EXT_VERSION}`);
 
-// Register at top level so the SW re-registers on every wake-up.
 registerAlarmHandler();
+registerKeepalive();
+
+// Start the bridge client. dispatchRpc is what the server calls into when
+// it sends an rpc.req frame — same shape as in-extension messages, so we
+// can reuse the same handlers map.
+startBridge(dispatchRpc);
 
 const handlers = {
+  // ----- capture (from page-hook via content script) -----
   'capture.observe': async ({ kind, data }) => {
     if (kind === 'graphql-seen') await recordObservation(data);
     return { acknowledged: true };
@@ -35,17 +49,29 @@ const handlers = {
       extVersion: EXT_VERSION,
     };
   },
-  // legacy (Comments tab — kept for later)
+
+  // ----- bridge config (modal options) -----
+  'bridge.getStatus': () => getBridgeStatus(),
+  'bridge.getSettings': () => getBridgeSettings(),
+  'bridge.setSettings': (p) => setBridgeSettings(p || {}),
+
+  // ----- raw X.com ops (used by both the modal "Comments" tab AND the
+  //       bridge RPCs from the bot) -----
   'x.tweetDetail': (p) => tweetDetail(p),
   'x.createTweet': (p) => createTweet(p),
   'x.searchTimeline': (p) => searchTimeline(p),
-  // Diagnostic: run one search and return as much info as possible.
+
+  // ----- bot bridge maintenance -----
+  // The bot may issue 'ping' as a no-arg liveness check.
+  ping: async () => ({ ok: true, ts: Date.now(), extVersion: EXT_VERSION }),
+
+  // ----- diagnostics (modal Status tab) -----
   'debug.testSearch': async ({ query }) => {
     const ops = await getAllOps();
     const op = ops.SearchTimeline;
     let result = { capturedOp: op || null };
     try {
-      const r = await searchTimeline({ query: query || 'crypto', count: 10, product: 'Latest' });
+      const r = await searchTimeline({ query: query || 'crypto' });
       result.ok = true;
       result.tweetCount = (r.tweets || []).length;
       result.sample = (r.tweets || []).slice(0, 2);
@@ -58,7 +84,8 @@ const handlers = {
     }
     return result;
   },
-  // auto-reply campaign
+
+  // ----- legacy in-extension auto-runner (kept for the modal users) -----
   'auto.getConfig': () => getConfig(),
   'auto.setConfig': (p) => setConfig(p || {}),
   'auto.getState': () => getState(),
@@ -69,14 +96,20 @@ const handlers = {
   'auto.resetSent': () => resetSent(),
 };
 
+// Used by both the chrome.runtime.onMessage path and the WS bridge.
+async function dispatchRpc(method, params) {
+  const fn = handlers[method];
+  if (!fn) throw new Error(`unknown method: ${method}`);
+  return fn(params || {});
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  const fn = handlers[msg && msg.type];
-  if (!fn) {
-    sendResponse({ ok: false, error: 'Unknown message: ' + (msg && msg.type) });
+  if (!msg || typeof msg.type !== 'string') {
+    sendResponse({ ok: false, error: 'bad message' });
     return false;
   }
   Promise.resolve()
-    .then(() => fn(msg.payload || {}))
+    .then(() => dispatchRpc(msg.type, msg.payload))
     .then((data) => sendResponse({ ok: true, data }))
     .catch((err) => sendResponse({ ok: false, error: err && err.message ? err.message : String(err) }));
   return true;

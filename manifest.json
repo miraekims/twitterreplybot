@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "X Reply Bot",
-  "version": "0.4.0",
-  "description": "Modal-based automation for X.com replies (comments / search / by @username).",
-  "permissions": ["storage", "cookies", "scripting", "alarms"],
+  "version": "0.5.0",
+  "description": "Modal-based automation for X.com replies. Connects to a local Docker bot via WebSocket bridge.",
+  "permissions": ["storage", "cookies", "scripting", "alarms", "tabs"],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
@@ -32,6 +32,10 @@
       "run_at": "document_idle"
     }
   ],
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "twitterreplybot@local",
