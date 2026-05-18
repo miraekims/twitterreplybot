@@ -374,7 +374,8 @@ async function runSearch(cfg) {
       }
     } catch (e) {
       if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
-      await log('warn', `search "${kw}" failed: ${e.message}`);
+      const detail = e.url ? ` [${new URL(e.url).pathname}]` : '';
+      await log('warn', `search "${kw}" failed: ${e.message}${detail}`);
     }
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 800));
   }

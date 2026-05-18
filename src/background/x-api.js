@@ -69,16 +69,30 @@ async function ensureOp(name) {
   return op;
 }
 
+// Build the GET URL by starting from the captured URL (which has the exact
+// path and query-string skeleton X used) and only swapping `variables`.
+// This is more robust than reconstructing the path from queryId, since X
+// occasionally serves the same operation under different hosts/paths
+// (e.g. `x.com` vs `api.x.com`).
+function buildGetUrl(op, opName, variables) {
+  const base = op.url
+    ? new URL(op.url)
+    : new URL(`${GQL_BASE}/${op.queryId}/${opName}`);
+  base.searchParams.set('variables', JSON.stringify(variables));
+  if (op.features && !base.searchParams.has('features')) {
+    base.searchParams.set('features', op.features);
+  }
+  if (op.fieldToggles && !base.searchParams.has('fieldToggles')) {
+    base.searchParams.set('fieldToggles', op.fieldToggles);
+  }
+  return base;
+}
+
 async function gqlGet(opName, variables) {
   const op = await ensureOp(opName);
-  const url = new URL(`${GQL_BASE}/${op.queryId}/${opName}`);
-  url.searchParams.set('variables', JSON.stringify(variables));
-  if (op.features) url.searchParams.set('features', op.features);
-  if (op.fieldToggles) url.searchParams.set('fieldToggles', op.fieldToggles);
-
+  const url = buildGetUrl(op, opName, variables);
   const headers = await buildHeaders();
-  // Setting referrer hints X that we're a logged-in client, not a script.
-  // Chrome may downgrade it depending on policy; that's fine.
+
   const resp = await fetch(url.toString(), {
     method: 'GET',
     credentials: 'include',
@@ -88,9 +102,12 @@ async function gqlGet(opName, variables) {
   });
   if (!resp.ok) {
     const t = await resp.text().catch(() => '');
-    const err = new Error(`${opName} HTTP ${resp.status}: ${t.slice(0, 200)}`);
+    const err = new Error(
+      `${opName} HTTP ${resp.status}: ${t.slice(0, 200)} (url=${url.pathname})`
+    );
     err.status = resp.status;
     err.body = t;
+    err.url = url.toString();
     throw err;
   }
   return resp.json();
@@ -150,7 +167,11 @@ export async function createTweet({ text, replyToTweetId }) {
     queryId: op.queryId,
   };
 
-  const url = `${GQL_BASE}/${op.queryId}/CreateTweet`;
+  // Same logic as for GETs: use the captured POST URL when available, so
+  // we always hit the exact path/host X used.
+  const url = op.url
+    ? op.url
+    : `${GQL_BASE}/${op.queryId}/CreateTweet`;
   const headers = await buildHeaders({ 'content-type': 'application/json' });
 
   const resp = await fetch(url, {
@@ -163,8 +184,12 @@ export async function createTweet({ text, replyToTweetId }) {
   });
   if (!resp.ok) {
     const t = await resp.text().catch(() => '');
-    const err = new Error(`CreateTweet HTTP ${resp.status}: ${t.slice(0, 200)}`);
+    const err = new Error(
+      `CreateTweet HTTP ${resp.status}: ${t.slice(0, 200)} (url=${new URL(url).pathname})`
+    );
     err.status = resp.status;
+    err.body = t;
+    err.url = url;
     throw err;
   }
   return resp.json();

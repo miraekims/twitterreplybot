@@ -328,6 +328,24 @@ const XBotModal = (() => {
             '\n→ CreateTweet: post or reply to anything once.'
           : 'All required ops captured. You can press Start in the Auto-reply tab.'),
     ));
+
+    // Diagnostics: run a single search and dump everything we know.
+    const diagInput = el('input', { class: 'xbot-input', placeholder: 'Test query', value: 'crypto' });
+    const diagBtn = el('button', { class: 'xbot-btn' }, 'Test search');
+    const diagOut = el('pre', { class: 'xbot-logs', style: 'margin-top:8px' }, '(click to run a one-shot SearchTimeline)');
+    diagBtn.addEventListener('click', async () => {
+      diagBtn.disabled = true; diagBtn.textContent = 'Running...';
+      diagOut.textContent = '';
+      const r = await send('debug.testSearch', { query: diagInput.value || 'crypto' });
+      diagBtn.disabled = false; diagBtn.textContent = 'Test search';
+      try { diagOut.textContent = JSON.stringify(r, null, 2); }
+      catch { diagOut.textContent = String(r); }
+    });
+    pane.appendChild(el('div', { class: 'xbot-card', style: 'margin-top:8px' },
+      el('div', { class: 'xbot-meta' }, el('strong', {}, 'Diagnostics')),
+      el('div', { class: 'xbot-row' }, diagInput, diagBtn),
+      diagOut,
+    ));
   }
 
   function updateFab() {
