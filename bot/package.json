@@ -1,0 +1,22 @@
+{
+  "name": "x-reply-bot",
+  "version": "0.1.0",
+  "description": "Standalone X.com auto-reply bot, controlled from Telegram. No browser required.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "optionalDependencies": {
+    "node-tls-client": "^1.2.6"
+  }
+}

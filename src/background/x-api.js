@@ -94,7 +94,6 @@ const VARS_BLACKLIST = new Set([
   'cursor',
   'referrer',
   'controller_data',
-  'count', // we set our own
 ]);
 
 function safeJsonParse(s) {
@@ -198,16 +197,15 @@ export async function tweetDetail({ tweetId }) {
 }
 
 // ---- SearchTimeline (find tweets matching a query) ----
-export async function searchTimeline({ query, count = 20, product = 'Latest' }) {
+// Important: we keep the captured `querySource` and `product` as-is. X's
+// SearchTimeline queryId is bound to the *exact* shape of variables it was
+// observed with — overriding `querySource` ("typed_query" vs "recent_search_click")
+// or `product` ("Latest" vs "Top") yields HTTP 404 even with a perfect URL,
+// because the persistent query expects a specific input.
+export async function searchTimeline({ query }) {
   const op = await ensureOp('SearchTimeline');
   const baseVars = cleanInheritedVars(safeJsonParse(op.variables));
-  const variables = {
-    ...baseVars,
-    rawQuery: query,
-    count,
-    querySource: 'typed_query',
-    product, // 'Top' | 'Latest' | 'People' | 'Photos' | 'Videos'
-  };
+  const variables = { ...baseVars, rawQuery: query };
   const data = await gqlGet('SearchTimeline', variables);
   return { tweets: extractTweets(data), raw: data };
 }

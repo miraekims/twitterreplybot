@@ -1,0 +1,21 @@
+{
+  "_README": "Copy this file to captured-ops.json and paste the captured shapes from the browser extension's Status > Diagnostics tab. The bot hot-reloads this file — no restart needed.",
+  "SearchTimeline": {
+    "queryId": "PASTE_FROM_EXTENSION",
+    "method": "GET",
+    "url": "https://x.com/i/api/graphql/PASTE_QUERY_ID/SearchTimeline?variables=...&features=...",
+    "variables": "{\"rawQuery\":\"crypto\",\"querySource\":\"typed_query\",\"product\":\"Latest\",\"count\":20}",
+    "features": "{...}",
+    "fieldToggles": null,
+    "body": null
+  },
+  "CreateTweet": {
+    "queryId": "PASTE_FROM_EXTENSION",
+    "method": "POST",
+    "url": "https://x.com/i/api/graphql/PASTE_QUERY_ID/CreateTweet",
+    "variables": null,
+    "features": null,
+    "fieldToggles": null,
+    "body": "{\"variables\":{...},\"features\":{...},\"queryId\":\"...\"}"
+  }
+}
