@@ -13,6 +13,7 @@ import { startTelegram } from './telegram/bot.js';
 import { db } from './core/db.js';
 import { startSupervisor } from './core/supervisor.js';
 import { logger } from './core/logger.js';
+import { isPersonaAiActive } from './persona/persona.js';
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -30,6 +31,15 @@ async function main() {
 
   await db.init();
   logger.info('boot', `db ready at ${db.path}`);
+
+  // Surface persona AI status at boot so misconfig is visible immediately,
+  // not 10 minutes later when the first reply gets rendered as raw template.
+  if (isPersonaAiActive()) {
+    const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    logger.info('boot', `persona AI: enabled (model=${model})`);
+  } else {
+    logger.info('boot', 'persona AI: disabled (set OPENAI_API_KEY to enable)');
+  }
 
   // Start campaign supervisor — wakes up every 5s, runs ticks for active campaigns.
   startSupervisor();

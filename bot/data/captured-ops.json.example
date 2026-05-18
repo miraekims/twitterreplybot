@@ -1,5 +1,21 @@
 {
-  "_README": "Copy this file to captured-ops.json and paste the captured shapes from the browser extension's Status > Diagnostics tab. The bot hot-reloads this file — no restart needed.",
+  "_README": [
+    "Copy this file to captured-ops.json and paste the captured shapes from",
+    "the browser extension's Status > Diagnostics tab. The bot hot-reloads",
+    "this file — no restart needed.",
+    "",
+    "Three sections:",
+    "  _headers       — fallback static x-client-transaction-id, used ONLY if",
+    "                   xclienttransaction auto-generation fails (e.g. X",
+    "                   changed the ondemand bundle shape again). Optional",
+    "                   but strongly recommended; without it a generation",
+    "                   failure produces null and X returns 404.",
+    "  SearchTimeline — captured GET shape (queryId, url, features blob)",
+    "  CreateTweet    — captured POST shape (queryId, url, body)"
+  ],
+  "_headers": {
+    "x-client-transaction-id": "PASTE_FROM_DEVTOOLS_OR_EXTENSION"
+  },
   "SearchTimeline": {
     "queryId": "PASTE_FROM_EXTENSION",
     "method": "GET",
