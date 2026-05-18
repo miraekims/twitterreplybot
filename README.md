@@ -1,67 +1,120 @@
 # X Reply Bot (MV3)
 
-Browser-extension modal that auto-replies to X.com posts matching your keywords,
-using your reply templates.
-
-> **v0.2** — Auto-reply campaign is the main flow.
-> Comments tab is kept (single-tweet replies) for later use.
-> Telegram bridge, AI rewriting, likes/follows are next.
+Browser extension for X.com that auto-replies to posts matching your keywords,
+using your reply templates, with anti-detection-grade pacing and filters.
 
 ## What it does
 
 You provide:
-- a list of **keywords** (e.g. `gm`, `gm degens`, `#crypto`, `$BTC`)
-- a list of **reply templates** (one per line, plain text or with `{author}` / `{name}`)
+- **keywords** — go straight into X search; supports operators
+  (e.g. `solana min_faves:50 lang:en -filter:replies`)
+- **reply templates** — picked randomly with a diversity cooldown so the same
+  template isn't used twice in a row; supports `{author}` and `{name}`
 
 The extension:
-1. Searches X for tweets matching ANY keyword (Latest tab) every N seconds.
-2. Filters out: replies, retweets, posts older than X minutes, posts under your
-   liked/followers thresholds, optionally posts containing links.
+1. Searches X for matching tweets every N seconds.
+2. Applies filters: min likes, min/max age, min author followers, lang,
+   skip replies/retweets/quotes/links, blacklist words, blacklist handles.
 3. Skips tweets it has already replied to (persistent dedup).
-4. Picks a random template, renders it, and posts a reply under the tweet.
-5. Sleeps a jittered delay between actions.
-6. Hard-stops on `401`/`403`/`429` so you can't spam yourself into a ban.
+4. Picks a template (avoiding ones used in the last `diversityCooldownSec`).
+5. Posts the reply, then waits a **log-normal** delay (humans don't have
+   Gaussian pause distributions — many short pauses, occasional long ones).
+6. Enforces an hourly token bucket: never exceeds `maxRepliesPerHour`.
+7. Honors a sleep window (e.g. 01:00–08:00) so the account looks alive.
+8. Hard-stops on `401`/`403`/`429` so you can't accidentally dig a hole.
 
 ## Self-healing X client
 
-We never hardcode `queryId` or GraphQL `features`. A page-world hook
-(`src/content/page-hook.js`) observes the live requests X.com makes and stores
-the latest shape per operation. When you press Start, the service worker replays
-that exact shape, swapping only what we need to change (search query, tweet
-text, reply target). When X ships a frontend update, the next time you load
-x.com the new shape is captured and we keep working.
+We never hardcode `queryId` or GraphQL `features`. A page-world hook observes
+the live requests X.com makes and stores the latest shape per operation. When
+you press Start, the service worker replays that shape, swapping only what we
+need to change (search query, tweet text, reply target). When X ships a new
+frontend, the next page load captures the new shape and we keep working.
 
-## Loading
+## Install (Chrome / Brave / Edge)
 
-### Chrome / Brave / Edge
-1. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → repo root.
-2. Open `https://x.com`. Blue floating bot button appears bottom-right.
+```bash
+git clone https://github.com/miraekims/twitterreplybot.git
+cd twitterreplybot
+git checkout feature/v0.1-skeleton
+git pull origin feature/v0.1-skeleton
+```
 
-### Firefox
-1. `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → `manifest.json`.
+Then in Chrome:
+1. `chrome://extensions` → enable **Developer mode**
+2. **Load unpacked** → pick this folder
+3. Open `https://x.com`. Bot button appears bottom-right.
 
-## Warm-up (do this once after install)
+If you've installed before, hit the **Reload** button on the extension card,
+then refresh `x.com` (F5).
 
-Badge says `2`. Two operations to capture:
+## Warm-up (once after install)
 
-1. **SearchTimeline** — type anything in X's search bar and press Enter.
-2. **CreateTweet** — post or reply to anything once.
+Trigger each operation once on x.com so the hook can capture it:
+- **SearchTimeline** — type anything in X's search and press Enter.
+- **CreateTweet** — post or reply to anything once.
 
-Badge changes to `OK`. Now the **Auto-reply** tab can run.
+Badge changes from `2` to `OK`. Now the **Auto-reply** tab can run.
 
-## Auto-reply tab
+## Recommended starter config
 
-- **Keywords** — one per line. They go straight into X's search.
-- **Templates** — one per line, picked randomly per reply. Supports
-  `{author}` (handle) and `{name}` (display name).
-- **Filters** — min likes, max age in minutes, min author followers,
-  language list, skip replies/retweets/links.
-- **Pacing** — min/max delay between replies (jittered), how often to re-search,
-  session cap (auto-stop after N replies).
-- **Save / Start / Stop / Reset history** — config persists across page reloads;
-  history of replied tweets is kept in `chrome.storage.local`.
+```
+Keywords:
+  gm
+  gm degens
+  solana lang:en min_faves:5 -filter:replies
 
-The floating button shows the count of replies sent in the current session.
+Templates:
+  gm fren
+  GM!
+  gm @{author}
+  GM ☕
+
+Filters:
+  Min likes: 1
+  Min tweet age (sec): 60
+  Max age (min): 15
+  Min followers: 100
+  Langs: en
+  Skip replies: ✓   Skip retweets: ✓   Skip quotes: ✓
+  Skip posts with links: ✗
+
+Pacing:
+  Min delay (sec): 30
+  Max delay (sec): 90
+  Search every (sec): 240
+  Max replies/hour: 10        ← start small for a fresh account
+  Template diversity (sec): 1800
+  Session cap: 5              ← first run
+
+Sleep window:
+  Enabled: ✗ (turn on later, e.g. 01:00–08:00 local)
+```
+
+The cap of 5 lets you verify everything works before scaling up.
+
+## Anti-detection notes (what's actually under our control here)
+
+This extension lives inside Chrome itself, not behind a proxy/Python stack.
+That means several anti-bot signals are **already authentic** without any
+work from us:
+
+- TLS fingerprint (JA3/JA4) — identical to your real Chrome (we ARE that Chrome)
+- `User-Agent`, Client Hints — identical to your real browser
+- Cookie jar — your real session, including all auxiliary cookies
+- Header order — Chrome's own order (we use `fetch`)
+
+What we explicitly handle in code:
+- `x-csrf-token` re-read from the live `ct0` cookie before every request
+- captured `x-twitter-active-user`, `x-twitter-auth-type`, `x-twitter-client-language` replayed
+- per-request stripping of stale pagination state (`cursor`, etc.)
+- log-normal delays, token-bucket per-hour cap, sleep window, diversity cooldown
+- min-tweet-age filter (don't reply within seconds of posting)
+- blacklist words & handles
+
+Things we do NOT do:
+- replay `x-client-transaction-id` (it's a per-request anti-replay token —
+  reusing it is a stronger signal than not sending it)
 
 ## Project layout
 
@@ -81,14 +134,14 @@ src/
   core/
     storage.js        # chrome.storage.local wrapper
     crypto.js         # AES-GCM (for upcoming TG/AI secrets)
-    auto-runner.js    # search → filter → reply loop
+    auto-runner.js    # MV3-safe alarm-driven loop
 ```
 
 ## Roadmap
 
-- [ ] AI rewriting (so each reply is unique even from the same template)
-- [ ] Telegram bot bridge (control / start / stop / logs from your phone)
-- [ ] Likes + follows automation
-- [ ] Keyword groups with per-group templates
+- [ ] AI rewriting of templates (every reply unique even from one base)
+- [ ] Telegram bot bridge (start/stop/logs from your phone)
+- [ ] Persona / lore (RAG over examples) — biggest quality lever
+- [ ] Likes & follows automation
+- [ ] Per-keyword priorities and per-keyword templates
 - [ ] CSV export of logs
-- [ ] Smarter Comments tab (filter, batch reply, keyword match inside replies)

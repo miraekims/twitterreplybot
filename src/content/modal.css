@@ -190,3 +190,8 @@
 
 #xbot-fab .xbot-badge.run { background: var(--xbot-accent); }
 .xbot-status .xbot-dot.run { background: var(--xbot-accent); }
+
+
+
+/* Single-column variant for full-width fields like blacklists. */
+.xbot-grid.xbot-grid-1 { grid-template-columns: 1fr; }

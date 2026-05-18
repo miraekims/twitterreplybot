@@ -1,16 +1,39 @@
 // X.com GraphQL client. Built on top of live observations from the page.
 //
 // Strategy: for each operation we replay the *same* request the official client
-// issued, only swapping what we actually need to change. This way we don't have
-// to keep a hardcoded list of GraphQL features (which drifts with every X
-// frontend release).
+// issued, swapping only what we actually need to change. We never hardcode
+// `queryId` or `features` — they're harvested from live traffic and persist
+// across X frontend releases.
+//
+// Subtle bit: when we replay the captured `variables`, we strip pagination
+// fields (`cursor`, `referrer`, ...). Otherwise the live X client may have
+// last issued e.g. SearchTimeline with a cursor, and reusing that cursor
+// against a new query yields HTTP 404.
 import { getOp, getHeaders } from './query-registry.js';
 
 const GQL_BASE = 'https://x.com/i/api/graphql';
 
+// Variables we never want to inherit from a captured request — they're either
+// pagination state or session-specific noise.
+const VARS_BLACKLIST = new Set([
+  'cursor',
+  'referrer',
+  'controller_data',
+  'count', // we set our own
+]);
+
 function safeJsonParse(s) {
   if (!s) return null;
   try { return JSON.parse(s); } catch (_) { return null; }
+}
+
+function cleanInheritedVars(obj) {
+  if (!obj || typeof obj !== 'object') return {};
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    if (!VARS_BLACKLIST.has(k)) out[k] = obj[k];
+  }
+  return out;
 }
 
 async function readCsrfFromCookie() {
@@ -30,6 +53,10 @@ async function buildHeaders(extra = {}) {
   // Always refresh CSRF from the live cookie — observations may be stale.
   const csrf = await readCsrfFromCookie();
   if (csrf) headers['x-csrf-token'] = csrf;
+  // X expects these even if not seen yet (some captures miss them).
+  if (!headers['x-twitter-active-user']) headers['x-twitter-active-user'] = 'yes';
+  if (!headers['x-twitter-auth-type']) headers['x-twitter-auth-type'] = 'OAuth2Session';
+  if (!headers['x-twitter-client-language']) headers['x-twitter-client-language'] = 'en';
   for (const k of Object.keys(extra)) headers[k] = extra[k];
   return headers;
 }
@@ -42,51 +69,46 @@ async function ensureOp(name) {
   return op;
 }
 
-function pickOneOf(names) {
-  return Promise.all(names.map((n) => getOp(n))).then((arr) => {
-    for (let i = 0; i < arr.length; i++) if (arr[i]) return { name: names[i], op: arr[i] };
-    return null;
-  });
-}
-
-// ---- TweetDetail (load replies under a tweet) ----
-export async function tweetDetail({ tweetId }) {
-  const op = await ensureOp('TweetDetail');
-  const baseVars = safeJsonParse(op.variables) || {};
-  const variables = { ...baseVars, focalTweetId: String(tweetId) };
-
-  const url = new URL(`${GQL_BASE}/${op.queryId}/TweetDetail`);
+async function gqlGet(opName, variables) {
+  const op = await ensureOp(opName);
+  const url = new URL(`${GQL_BASE}/${op.queryId}/${opName}`);
   url.searchParams.set('variables', JSON.stringify(variables));
   if (op.features) url.searchParams.set('features', op.features);
   if (op.fieldToggles) url.searchParams.set('fieldToggles', op.fieldToggles);
 
   const headers = await buildHeaders();
+  // Setting referrer hints X that we're a logged-in client, not a script.
+  // Chrome may downgrade it depending on policy; that's fine.
   const resp = await fetch(url.toString(), {
-    method: 'GET', credentials: 'include', headers,
+    method: 'GET',
+    credentials: 'include',
+    headers,
+    referrer: 'https://x.com/',
+    referrerPolicy: 'strict-origin-when-cross-origin',
   });
   if (!resp.ok) {
-    const err = new Error(`TweetDetail HTTP ${resp.status}`);
+    const t = await resp.text().catch(() => '');
+    const err = new Error(`${opName} HTTP ${resp.status}: ${t.slice(0, 200)}`);
     err.status = resp.status;
+    err.body = t;
     throw err;
   }
-  const data = await resp.json();
+  return resp.json();
+}
+
+// ---- TweetDetail (load replies under a tweet) ----
+export async function tweetDetail({ tweetId }) {
+  const op = await ensureOp('TweetDetail');
+  const baseVars = cleanInheritedVars(safeJsonParse(op.variables));
+  const variables = { ...baseVars, focalTweetId: String(tweetId) };
+  const data = await gqlGet('TweetDetail', variables);
   return { replies: extractReplies(data, tweetId), raw: data };
 }
 
 // ---- SearchTimeline (find tweets matching a query) ----
-// X frontend uses one of: SearchTimeline, ExploreSidebar, AdaptiveSearch...
-// We try the common ones in order.
 export async function searchTimeline({ query, count = 20, product = 'Latest' }) {
-  const found = await pickOneOf(['SearchTimeline']);
-  if (!found) {
-    throw new Error(
-      'SearchTimeline not captured yet. On x.com, type something into the ' +
-      'search bar and press Enter once to warm it up.'
-    );
-  }
-  const { op } = found;
-  const baseVars = safeJsonParse(op.variables) || {};
-
+  const op = await ensureOp('SearchTimeline');
+  const baseVars = cleanInheritedVars(safeJsonParse(op.variables));
   const variables = {
     ...baseVars,
     rawQuery: query,
@@ -94,22 +116,7 @@ export async function searchTimeline({ query, count = 20, product = 'Latest' }) 
     querySource: 'typed_query',
     product, // 'Top' | 'Latest' | 'People' | 'Photos' | 'Videos'
   };
-
-  const url = new URL(`${GQL_BASE}/${op.queryId}/SearchTimeline`);
-  url.searchParams.set('variables', JSON.stringify(variables));
-  if (op.features) url.searchParams.set('features', op.features);
-  if (op.fieldToggles) url.searchParams.set('fieldToggles', op.fieldToggles);
-
-  const headers = await buildHeaders();
-  const resp = await fetch(url.toString(), {
-    method: 'GET', credentials: 'include', headers,
-  });
-  if (!resp.ok) {
-    const err = new Error(`SearchTimeline HTTP ${resp.status}`);
-    err.status = resp.status;
-    throw err;
-  }
-  const data = await resp.json();
+  const data = await gqlGet('SearchTimeline', variables);
   return { tweets: extractTweets(data), raw: data };
 }
 
@@ -117,7 +124,7 @@ export async function searchTimeline({ query, count = 20, product = 'Latest' }) 
 export async function createTweet({ text, replyToTweetId }) {
   const op = await ensureOp('CreateTweet');
   const baseBody = safeJsonParse(op.body) || {};
-  const baseVars = baseBody.variables || {};
+  const baseVars = cleanInheritedVars(baseBody.variables);
   const baseFeatures = baseBody.features || safeJsonParse(op.features) || {};
 
   const variables = {
@@ -147,7 +154,12 @@ export async function createTweet({ text, replyToTweetId }) {
   const headers = await buildHeaders({ 'content-type': 'application/json' });
 
   const resp = await fetch(url, {
-    method: 'POST', credentials: 'include', headers, body: JSON.stringify(body),
+    method: 'POST',
+    credentials: 'include',
+    headers,
+    body: JSON.stringify(body),
+    referrer: 'https://x.com/',
+    referrerPolicy: 'strict-origin-when-cross-origin',
   });
   if (!resp.ok) {
     const t = await resp.text().catch(() => '');
@@ -161,7 +173,6 @@ export async function createTweet({ text, replyToTweetId }) {
 // ---- response walkers ----
 // X responses are deeply nested; cheaper to walk than to encode every shape.
 
-// Extract direct replies to a given parent tweet id.
 function extractReplies(data, parentId) {
   const out = [];
   const seen = new Set();
@@ -188,7 +199,6 @@ function extractReplies(data, parentId) {
   return out;
 }
 
-// Extract top-level tweets from a Search/Timeline response.
 function extractTweets(data) {
   const out = [];
   const seen = new Set();
@@ -213,6 +223,7 @@ function extractTweets(data) {
         lang: tw.lang || null,
         isReply: !!tw.in_reply_to_status_id_str,
         isRetweet: !!tw.retweeted_status_result,
+        isQuote: !!tw.is_quote_status,
         hasUrls: !!(tw.entities && tw.entities.urls && tw.entities.urls.length),
         authorId: u?.rest_id || null,
         authorHandle: u?.legacy?.screen_name || null,

@@ -2,30 +2,28 @@
 //
 // In Manifest V3 the service worker is killed after ~30s of inactivity.
 // A long-running setTimeout/setInterval loop would die silently. Instead,
-// each step is one alarm tick:
+// each step is one alarm tick, with all state persisted to chrome.storage.local
+// so it survives SW restarts.
 //
-//   tick:
-//     1. read state from storage (state survives SW restarts)
-//     2. decide next action (search | reply | sleep)
-//     3. perform exactly one action
-//     4. schedule the next alarm and return
-//
-// State machine (persisted in storage):
-//   status:         'idle' | 'running' | 'stopped'
-//   queue:          [{ id, authorHandle, authorName, _matchedKeyword, ... }]
-//   sentInSession:  number
-//   lastSearchAt:   epoch ms
-//   nextActionAt:   epoch ms (when the next tick should do something)
-//   lastError:      string | null
+// Anti-pattern protections (lifted from previously-built best practices):
+//   - token-bucket rate limit: maxRepliesPerHour
+//   - sleep window: optional quiet hours (HH:MM..HH:MM, local time)
+//   - log-normal delays: humans don't have Gaussian pause distributions
+//   - min tweet age: never reply within seconds of a post
+//   - diversity cooldown: don't repeat the same template too soon
+//   - blacklists: words & user handles that bypass the reply pipeline
+//   - hard stop on auth failures (401/403/429): never spam into a wall
 import { searchTimeline, createTweet } from '../background/x-api.js';
 import { storage } from './storage.js';
 
 const STATE_KEY  = 'auto.state';
 const SENT_KEY   = 'auto.sent';     // { [tweetId]: ts }
-const LOGS_KEY   = 'auto.logs';     // [{ ts, level, msg }]
+const LOGS_KEY   = 'auto.logs';
 const CONFIG_KEY = 'auto.config';
-const ALARM_NAME = 'xbot.autoTick';
+const RECENT_TPL_KEY = 'auto.recentTpl'; // [{ tpl, ts }]
+const HOUR_LOG_KEY = 'auto.hourLog';     // [ts1, ts2, ...] — replies in last 1h
 
+const ALARM_NAME = 'xbot.autoTick';
 const MAX_LOGS = 200;
 const MAX_SENT = 5000;
 
@@ -34,17 +32,28 @@ const defaultConfig = {
   templates: [],
   filters: {
     minLikes: 0,
-    maxAgeMinutes: 240,
+    minTweetAgeSec: 60,        // do not reply within 60s of post (looks botty)
+    maxAgeMinutes: 30,
     skipReplies: true,
     skipRetweets: true,
+    skipQuotes: false,
     skipWithUrls: false,
-    minAuthorFollowers: 0,
+    minAuthorFollowers: 50,
     langs: [],
+    blacklistWords: [],        // case-insensitive substring match on tweet text
+    blacklistHandles: [],      // case-insensitive screen_name match
   },
   pacing: {
     minDelaySec: 25,
-    maxDelaySec: 60,
+    maxDelaySec: 90,
     searchEverySec: 180,
+    maxRepliesPerHour: 15,     // hard cap: token bucket over rolling 60min
+    diversityCooldownSec: 1800,// don't repeat same template within 30min
+  },
+  sleep: {
+    enabled: false,
+    startHHMM: '01:00',
+    endHHMM:   '08:00',
   },
   sessionCap: 30,
 };
@@ -61,21 +70,28 @@ const defaultState = {
 
 // ---------- config / state ----------
 export async function getConfig() {
-  return { ...defaultConfig, ...(await storage.get(CONFIG_KEY, {})) };
+  return mergeDeep(defaultConfig, (await storage.get(CONFIG_KEY, {})) || {});
+}
+function mergeDeep(base, patch) {
+  const out = Array.isArray(base) ? [...base] : { ...base };
+  for (const k of Object.keys(patch || {})) {
+    const v = patch[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object') {
+      out[k] = mergeDeep(base[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 export async function setConfig(patch) {
   const cur = await getConfig();
-  const next = {
-    ...cur,
-    ...patch,
-    filters: { ...cur.filters, ...(patch.filters || {}) },
-    pacing:  { ...cur.pacing,  ...(patch.pacing  || {}) },
-  };
+  const next = mergeDeep(cur, patch || {});
   await storage.set(CONFIG_KEY, next);
   return next;
 }
 export async function getState() {
-  return { ...defaultState, ...(await storage.get(STATE_KEY, {})) };
+  return { ...defaultState, ...((await storage.get(STATE_KEY, {})) || {}) };
 }
 async function setState(patch) {
   const cur = await getState();
@@ -114,58 +130,134 @@ async function markSent(id) {
   }, {});
 }
 
-// ---------- helpers ----------
-function jitterSec(min, max) {
-  const lo = Math.max(1, min | 0);
-  const hi = Math.max(lo, max | 0);
-  return lo + Math.random() * (hi - lo);
+// ---------- delay distribution ----------
+// log-normal: many short pauses, a few long ones. Looks human.
+function logNormalSec(minSec, maxSec) {
+  const lo = Math.max(1, minSec);
+  const hi = Math.max(lo + 1, maxSec);
+  // Box-Muller → standard normal
+  let u1 = Math.random(); if (u1 < 1e-9) u1 = 1e-9;
+  const u2 = Math.random();
+  const n = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  // Map to log-normal centred between lo..hi
+  const mid = (lo + hi) / 2;
+  const sigma = 0.45;
+  const mu = Math.log(mid);
+  let v = Math.exp(mu + sigma * n);
+  if (v < lo) v = lo + Math.random() * (hi - lo) * 0.2;
+  if (v > hi * 1.5) v = hi - Math.random() * (hi - lo) * 0.2;
+  return v;
 }
+
+// ---------- sleep window ----------
+function inSleepWindow(cfgSleep, nowMs = Date.now()) {
+  if (!cfgSleep || !cfgSleep.enabled) return null;
+  const d = new Date(nowMs);
+  const cur = d.getHours() * 60 + d.getMinutes();
+  const start = parseHHMM(cfgSleep.startHHMM);
+  const end = parseHHMM(cfgSleep.endHHMM);
+  if (start == null || end == null) return null;
+  let inside;
+  if (start <= end) inside = cur >= start && cur < end;
+  else inside = cur >= start || cur < end; // window crosses midnight
+  if (!inside) return null;
+  // Compute seconds until window end.
+  let mins;
+  if (start <= end) mins = end - cur;
+  else mins = cur >= start ? (24 * 60 - cur) + end : end - cur;
+  return mins * 60;
+}
+function parseHHMM(s) {
+  if (!s) return null;
+  const m = String(s).match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = +m[1], min = +m[2];
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+// ---------- token bucket ----------
+async function recordHourlyAction() {
+  await storage.update(HOUR_LOG_KEY, (cur) => {
+    const arr = Array.isArray(cur) ? cur.slice() : [];
+    arr.push(Date.now());
+    return arr;
+  }, []);
+}
+async function pruneHourlyAndCount() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  const cur = (await storage.get(HOUR_LOG_KEY, [])) || [];
+  const kept = cur.filter((t) => t >= cutoff);
+  if (kept.length !== cur.length) await storage.set(HOUR_LOG_KEY, kept);
+  return kept;
+}
+
+// ---------- diversity ----------
+async function recordTemplateUse(tpl) {
+  await storage.update(RECENT_TPL_KEY, (cur) => {
+    const arr = Array.isArray(cur) ? cur.slice() : [];
+    arr.push({ tpl, ts: Date.now() });
+    // Keep only last 50 entries.
+    return arr.slice(-50);
+  }, []);
+}
+async function pickTemplate(templates, cooldownSec) {
+  if (!templates || !templates.length) return null;
+  const recent = ((await storage.get(RECENT_TPL_KEY, [])) || [])
+    .filter((e) => Date.now() - e.ts < cooldownSec * 1000)
+    .map((e) => e.tpl);
+  const recentSet = new Set(recent);
+  const pool = templates.filter((t) => !recentSet.has(t));
+  const src = pool.length ? pool : templates;
+  return src[Math.floor(Math.random() * src.length)];
+}
+
+// ---------- filters ----------
 function passesFilters(t, f) {
   if (!t || !t.id || !t.text) return false;
   if (f.skipReplies && t.isReply) return false;
   if (f.skipRetweets && t.isRetweet) return false;
+  if (f.skipQuotes && t.isQuote) return false;
   if (f.skipWithUrls && t.hasUrls) return false;
   if (f.minLikes && (t.favoriteCount || 0) < f.minLikes) return false;
   if (f.minAuthorFollowers && (t.authorFollowers || 0) < f.minAuthorFollowers) return false;
   if (f.langs && f.langs.length && t.lang && !f.langs.includes(t.lang)) return false;
-  if (f.maxAgeMinutes && t.createdAt) {
-    const age = (Date.now() - new Date(t.createdAt).getTime()) / 60000;
-    if (age > f.maxAgeMinutes) return false;
+
+  if (t.createdAt) {
+    const ageSec = (Date.now() - new Date(t.createdAt).getTime()) / 1000;
+    if (f.minTweetAgeSec && ageSec < f.minTweetAgeSec) return false;
+    if (f.maxAgeMinutes && ageSec > f.maxAgeMinutes * 60) return false;
+  }
+
+  const handle = (t.authorHandle || '').toLowerCase();
+  for (const h of (f.blacklistHandles || [])) {
+    if (h && handle === String(h).toLowerCase().replace(/^@/, '')) return false;
+  }
+  const text = (t.text || '').toLowerCase();
+  for (const w of (f.blacklistWords || [])) {
+    if (w && text.includes(String(w).toLowerCase())) return false;
   }
   return true;
 }
+
 function renderTemplate(tpl, ctx) {
   return tpl.replace(/\{(\w+)\}/g, (_, k) => (ctx[k] != null ? String(ctx[k]) : ''));
-}
-function pickTemplate(templates) {
-  if (!templates || !templates.length) return null;
-  return templates[Math.floor(Math.random() * templates.length)];
 }
 
 // ---------- alarms ----------
 async function scheduleNext(delaySec) {
   const when = Date.now() + Math.max(1, delaySec) * 1000;
   await setState({ nextActionAt: when });
-  // chrome.alarms minimum is technically 30s in production builds, but in
-  // unpacked dev mode any positive delayInMinutes works. We use `when:` so
-  // we can pass an absolute timestamp without rounding.
   chrome.alarms.create(ALARM_NAME, { when });
 }
-async function clearAlarm() {
-  await chrome.alarms.clear(ALARM_NAME);
-}
+async function clearAlarm() { await chrome.alarms.clear(ALARM_NAME); }
 
 // ---------- core tick ----------
-// One tick = one decision + one action. Never blocks for long.
 export async function tick() {
   const state = await getState();
-  if (state.status !== 'running') {
-    await clearAlarm();
-    return;
-  }
+  if (state.status !== 'running') { await clearAlarm(); return; }
   const cfg = await getConfig();
 
-  // Validation guards.
   if (!cfg.keywords.length || !cfg.templates.length) {
     await log('error', 'no keywords or templates — stopping');
     await stop();
@@ -177,10 +269,28 @@ export async function tick() {
     return;
   }
 
-  // 1) Queue empty? Run search and refill.
+  // Sleep window?
+  const sleepRemain = inSleepWindow(cfg.sleep);
+  if (sleepRemain != null) {
+    await log('info', `in sleep window — pausing ${Math.ceil(sleepRemain / 60)} min`);
+    await scheduleNext(Math.min(sleepRemain, 30 * 60));
+    return;
+  }
+
+  // Token bucket: hourly cap?
+  const recent = await pruneHourlyAndCount();
+  if (recent.length >= cfg.pacing.maxRepliesPerHour) {
+    const oldest = recent[0];
+    const wait = Math.max(60, Math.ceil((oldest + 60 * 60 * 1000 - Date.now()) / 1000));
+    await log('info', `hourly cap (${cfg.pacing.maxRepliesPerHour}) reached — sleeping ${wait}s`);
+    await scheduleNext(Math.min(wait, 10 * 60));
+    return;
+  }
+
+  // 1) Queue empty → search
   if (!state.queue.length) {
     const sinceSearch = Date.now() - (state.lastSearchAt || 0);
-    if (sinceSearch < cfg.pacing.searchEverySec * 1000) {
+    if (state.lastSearchAt && sinceSearch < cfg.pacing.searchEverySec * 1000) {
       const wait = Math.ceil((cfg.pacing.searchEverySec * 1000 - sinceSearch) / 1000);
       await scheduleNext(wait);
       return;
@@ -195,11 +305,9 @@ export async function tick() {
         await stop();
         return;
       }
-      // soft failure — try again later
-      await scheduleNext(jitterSec(15, 30));
+      await scheduleNext(logNormalSec(20, 60));
       return;
     }
-    // Filter + dedup.
     const usable = [];
     for (const t of candidates) {
       if (!passesFilters(t, cfg.filters)) continue;
@@ -208,40 +316,36 @@ export async function tick() {
     }
     await setState({ queue: usable, lastSearchAt: Date.now() });
     await log('info', `search → ${candidates.length} found, ${usable.length} usable`);
-    // Even if usable=0, schedule next tick so the loop keeps going.
     const delay = usable.length
-      ? jitterSec(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec)
+      ? logNormalSec(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec)
       : cfg.pacing.searchEverySec;
     await scheduleNext(delay);
     return;
   }
 
-  // 2) Pop one tweet from the queue and reply.
+  // 2) Pop & reply
   const queue = state.queue.slice();
   const t = queue.shift();
   await setState({ queue });
 
-  // Race-condition guard: someone may have replied between search and now.
-  if (await isAlreadySent(t.id)) {
-    await scheduleNext(2);
-    return;
-  }
+  if (await isAlreadySent(t.id)) { await scheduleNext(2); return; }
 
-  const tpl = pickTemplate(cfg.templates);
+  const tpl = await pickTemplate(cfg.templates, cfg.pacing.diversityCooldownSec);
   const text = renderTemplate(tpl, {
     author: t.authorHandle || '',
-    name:   t.authorName   || '',
+    name: t.authorName || '',
   });
 
   try {
     await createTweet({ text, replyToTweetId: t.id });
     await markSent(t.id);
+    await recordHourlyAction();
+    await recordTemplateUse(tpl);
     const s = await getState();
     await setState({ sentInSession: s.sentInSession + 1 });
     await log('info', `replied to @${t.authorHandle} (${t.id}) [kw="${t._matchedKeyword}"]`);
   } catch (e) {
     await log('error', `reply to ${t.id} failed: ${e.message}`);
-    // Mark as sent so we don't retry the same broken tweet forever.
     await markSent(t.id);
     if (e.status === 401 || e.status === 403 || e.status === 429) {
       await setState({ lastError: e.message });
@@ -250,14 +354,13 @@ export async function tick() {
     }
   }
 
-  // Re-check session cap after sending.
   const s2 = await getState();
   if (s2.sentInSession >= cfg.sessionCap) {
     await log('info', `session cap reached (${cfg.sessionCap}) — stopping`);
     await stop();
     return;
   }
-  await scheduleNext(jitterSec(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec));
+  await scheduleNext(logNormalSec(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec));
 }
 
 async function runSearch(cfg) {
@@ -270,11 +373,9 @@ async function runSearch(cfg) {
         if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _matchedKeyword: kw }); }
       }
     } catch (e) {
-      // Hard errors must propagate so the caller can hard-stop.
       if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
       await log('warn', `search "${kw}" failed: ${e.message}`);
     }
-    // Tiny pause between keyword searches; not the main pacing.
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 800));
   }
   return all;
@@ -307,14 +408,12 @@ export async function resetSent() {
   await log('info', 'sent-history cleared');
 }
 
-// Wire alarms to tick(). The SW may have just woken up; calling tick() is safe
-// because all state is in storage.
 export function registerAlarmHandler() {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== ALARM_NAME) return;
     tick().catch(async (e) => {
       await log('error', 'tick crashed: ' + (e && e.message ? e.message : String(e)));
-      await setState({ status: 'idle', lastError: String(e && e.message || e) });
+      await setState({ status: 'idle', lastError: String((e && e.message) || e) });
     });
   });
 }

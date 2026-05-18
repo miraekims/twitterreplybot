@@ -11,7 +11,7 @@ const XBotModal = (() => {
   let activeTab = 'auto';
   let captureState = { ready: false, ops: {} };
   let autoState = { status: 'idle', sentInSession: 0 };
-  let autoConfig = null;
+  let autoConfigLoaded = false;
   let pollHandle = null;
 
   function el(tag, attrs = {}, ...children) {
@@ -47,40 +47,51 @@ const XBotModal = (() => {
     activeTab = name;
     root.querySelectorAll('.xbot-tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
     root.querySelectorAll('.xbot-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === name));
+    if (name === 'status') renderStatus();
   }
 
   // ---------- AUTO tab ----------
   function buildAutoPane() {
     const pane = el('div', { class: 'xbot-pane active', 'data-pane': 'auto' });
 
-    const kwLabel = el('label', { class: 'xbot-label' }, 'Keywords (one per line — these go straight into X search)');
+    const kwLabel = el('label', { class: 'xbot-label' },
+      'Keywords (one per line — these go straight into X search; supports operators like "min_faves:50 lang:en -filter:replies")');
     const kwArea = el('textarea', {
-      class: 'xbot-textarea',
-      rows: '4',
-      placeholder: 'gm\ngm degens\ngm all\n#crypto\n$BTC',
+      class: 'xbot-textarea', rows: '4',
+      placeholder: 'gm\ngm degens\ngm all\nsolana min_faves:5 lang:en -filter:replies',
     });
 
-    const tplLabel = el('label', { class: 'xbot-label' }, 'Reply templates (one per line — random pick per reply; supports {author}, {name})');
-    const tplArea = el('textarea', {
-      class: 'xbot-textarea',
-      rows: '5',
-      placeholder: 'gm fren\nGM! Have a great one\ngm @{author} 🫡',
+    const tplLabel = el('label', { class: 'xbot-label' },
+      'Reply templates (one per line — random pick with diversity cooldown; supports {author}, {name})');
+    const tplArea = el('textarea', { class: 'xbot-textarea', rows: '5',
+      placeholder: 'gm fren\nGM! Have a great one\ngm @{author}',
     });
 
-    // Filters row
-    const fMinLikes = numInput('Min likes', 0);
-    const fMaxAge = numInput('Max age (min)', 240);
-    const fMinFollowers = numInput('Min followers', 0);
+    // Filters
+    const fMinLikes = numInput('Min likes', 1);
+    const fMinAgeSec = numInput('Min tweet age (sec)', 60);
+    const fMaxAge = numInput('Max age (min)', 30);
+    const fMinFollowers = numInput('Min followers', 50);
     const fLangs = textInput('Langs (comma) e.g. en,ru', '');
     const fSkipReplies = check('Skip replies', true);
     const fSkipRetweets = check('Skip retweets', true);
+    const fSkipQuotes = check('Skip quotes', false);
     const fSkipUrls = check('Skip posts with links', false);
+    const fBlackWords = textInput('Blacklist words (comma)', '');
+    const fBlackHandles = textInput('Blacklist @handles (comma)', '');
 
-    // Pacing row
+    // Pacing
     const pMin = numInput('Min delay (sec)', 25);
-    const pMax = numInput('Max delay (sec)', 60);
+    const pMax = numInput('Max delay (sec)', 90);
     const pSearch = numInput('Search every (sec)', 180);
+    const pHour = numInput('Max replies/hour', 15);
+    const pDiv = numInput('Template diversity (sec)', 1800);
     const pCap = numInput('Session cap (replies)', 30);
+
+    // Sleep window
+    const sleepEn = check('Sleep window enabled', false);
+    const sleepStart = textInput('Sleep start (HH:MM, local)', '01:00');
+    const sleepEnd = textInput('Sleep end (HH:MM, local)', '08:00');
 
     const startBtn = el('button', { class: 'xbot-btn' }, 'Start');
     const stopBtn = el('button', { class: 'xbot-btn secondary' }, 'Stop');
@@ -93,23 +104,34 @@ const XBotModal = (() => {
 
     function readForm() {
       const lines = (s) => s.split('\n').map((x) => x.trim()).filter(Boolean);
+      const csv = (s) => s.split(',').map((x) => x.trim()).filter(Boolean);
       return {
         keywords: lines(kwArea.value),
         templates: lines(tplArea.value),
         filters: {
           minLikes: numVal(fMinLikes, 0),
-          maxAgeMinutes: numVal(fMaxAge, 240),
+          minTweetAgeSec: numVal(fMinAgeSec, 60),
+          maxAgeMinutes: numVal(fMaxAge, 30),
           minAuthorFollowers: numVal(fMinFollowers, 0),
-          langs: fLangs.querySelector('input').value
-            .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean),
+          langs: csv(getInput(fLangs).value).map((x) => x.toLowerCase()),
           skipReplies: checkVal(fSkipReplies),
           skipRetweets: checkVal(fSkipRetweets),
+          skipQuotes: checkVal(fSkipQuotes),
           skipWithUrls: checkVal(fSkipUrls),
+          blacklistWords: csv(getInput(fBlackWords).value),
+          blacklistHandles: csv(getInput(fBlackHandles).value).map((s) => s.replace(/^@/, '')),
         },
         pacing: {
           minDelaySec: numVal(pMin, 25),
-          maxDelaySec: numVal(pMax, 60),
+          maxDelaySec: numVal(pMax, 90),
           searchEverySec: numVal(pSearch, 180),
+          maxRepliesPerHour: numVal(pHour, 15),
+          diversityCooldownSec: numVal(pDiv, 1800),
+        },
+        sleep: {
+          enabled: checkVal(sleepEn),
+          startHHMM: getInput(sleepStart).value.trim() || '01:00',
+          endHHMM: getInput(sleepEnd).value.trim() || '08:00',
         },
         sessionCap: numVal(pCap, 30),
       };
@@ -118,36 +140,44 @@ const XBotModal = (() => {
     function writeForm(cfg) {
       kwArea.value = (cfg.keywords || []).join('\n');
       tplArea.value = (cfg.templates || []).join('\n');
-      setNum(fMinLikes, cfg.filters?.minLikes ?? 0);
-      setNum(fMaxAge, cfg.filters?.maxAgeMinutes ?? 240);
-      setNum(fMinFollowers, cfg.filters?.minAuthorFollowers ?? 0);
-      fLangs.querySelector('input').value = (cfg.filters?.langs || []).join(',');
-      setCheck(fSkipReplies, cfg.filters?.skipReplies ?? true);
-      setCheck(fSkipRetweets, cfg.filters?.skipRetweets ?? true);
-      setCheck(fSkipUrls, cfg.filters?.skipWithUrls ?? false);
-      setNum(pMin, cfg.pacing?.minDelaySec ?? 25);
-      setNum(pMax, cfg.pacing?.maxDelaySec ?? 60);
-      setNum(pSearch, cfg.pacing?.searchEverySec ?? 180);
+      const f = cfg.filters || {};
+      setNum(fMinLikes, f.minLikes ?? 0);
+      setNum(fMinAgeSec, f.minTweetAgeSec ?? 60);
+      setNum(fMaxAge, f.maxAgeMinutes ?? 30);
+      setNum(fMinFollowers, f.minAuthorFollowers ?? 0);
+      getInput(fLangs).value = (f.langs || []).join(',');
+      setCheck(fSkipReplies, f.skipReplies ?? true);
+      setCheck(fSkipRetweets, f.skipRetweets ?? true);
+      setCheck(fSkipQuotes, f.skipQuotes ?? false);
+      setCheck(fSkipUrls, f.skipWithUrls ?? false);
+      getInput(fBlackWords).value = (f.blacklistWords || []).join(',');
+      getInput(fBlackHandles).value = (f.blacklistHandles || []).join(',');
+      const p = cfg.pacing || {};
+      setNum(pMin, p.minDelaySec ?? 25);
+      setNum(pMax, p.maxDelaySec ?? 90);
+      setNum(pSearch, p.searchEverySec ?? 180);
+      setNum(pHour, p.maxRepliesPerHour ?? 15);
+      setNum(pDiv, p.diversityCooldownSec ?? 1800);
       setNum(pCap, cfg.sessionCap ?? 30);
+      const sl = cfg.sleep || {};
+      setCheck(sleepEn, sl.enabled ?? false);
+      getInput(sleepStart).value = sl.startHHMM || '01:00';
+      getInput(sleepEnd).value = sl.endHHMM || '08:00';
     }
 
     saveBtn.addEventListener('click', async () => {
       error.textContent = '';
       const r = await send('auto.setConfig', readForm());
       if (!r.ok) { error.textContent = r.error; return; }
-      saveBtn.textContent = 'Saved';
-      setTimeout(() => (saveBtn.textContent = 'Save'), 1200);
+      saveBtn.textContent = 'Saved'; setTimeout(() => (saveBtn.textContent = 'Save'), 1200);
     });
-
     startBtn.addEventListener('click', async () => {
       error.textContent = '';
       const cfg = readForm();
       if (!cfg.keywords.length) { error.textContent = 'Add at least one keyword.'; return; }
       if (!cfg.templates.length) { error.textContent = 'Add at least one template.'; return; }
-      const s = await send('auto.setConfig', cfg);
-      if (!s.ok) { error.textContent = s.error; return; }
-      const r = await send('auto.start', {});
-      if (!r.ok) { error.textContent = r.error; return; }
+      const s = await send('auto.setConfig', cfg); if (!s.ok) { error.textContent = s.error; return; }
+      const r = await send('auto.start', {}); if (!r.ok) { error.textContent = r.error; return; }
       refreshAuto();
     });
     stopBtn.addEventListener('click', async () => { await send('auto.stop', {}); refreshAuto(); });
@@ -156,88 +186,83 @@ const XBotModal = (() => {
       await send('auto.resetSent', {});
     });
 
-    pane.appendChild(kwLabel);
-    pane.appendChild(kwArea);
-    pane.appendChild(tplLabel);
-    pane.appendChild(tplArea);
+    pane.appendChild(kwLabel); pane.appendChild(kwArea);
+    pane.appendChild(tplLabel); pane.appendChild(tplArea);
 
     pane.appendChild(el('div', { class: 'xbot-section' }, 'Filters'));
     pane.appendChild(el('div', { class: 'xbot-grid' },
-      fMinLikes, fMaxAge, fMinFollowers, fLangs,
-      fSkipReplies, fSkipRetweets, fSkipUrls,
+      fMinLikes, fMinAgeSec, fMaxAge, fMinFollowers,
+      fSkipReplies, fSkipRetweets, fSkipQuotes, fSkipUrls,
     ));
+    pane.appendChild(el('div', { class: 'xbot-grid xbot-grid-1' }, fLangs));
+    pane.appendChild(el('div', { class: 'xbot-grid xbot-grid-1' }, fBlackWords));
+    pane.appendChild(el('div', { class: 'xbot-grid xbot-grid-1' }, fBlackHandles));
 
     pane.appendChild(el('div', { class: 'xbot-section' }, 'Pacing & limits'));
-    pane.appendChild(el('div', { class: 'xbot-grid' }, pMin, pMax, pSearch, pCap));
+    pane.appendChild(el('div', { class: 'xbot-grid' },
+      pMin, pMax, pSearch, pHour, pDiv, pCap,
+    ));
 
-    pane.appendChild(el('div', { class: 'xbot-row', style: 'margin-top:10px' },
+    pane.appendChild(el('div', { class: 'xbot-section' }, 'Sleep window (local time)'));
+    pane.appendChild(el('div', { class: 'xbot-grid' }, sleepEn, sleepStart, sleepEnd));
+
+    pane.appendChild(el('div', { class: 'xbot-row', style: 'margin-top:14px' },
       startBtn, stopBtn, saveBtn, resetBtn,
     ));
     pane.appendChild(error);
+
     pane.appendChild(el('div', { class: 'xbot-section' }, 'Status'));
     pane.appendChild(statusLine);
     pane.appendChild(el('div', { class: 'xbot-section' }, 'Logs'));
     pane.appendChild(logsBox);
 
-    // expose updaters so refreshAuto() can use them
     pane._writeForm = writeForm;
     pane._statusLine = statusLine;
     pane._logsBox = logsBox;
     pane._startBtn = startBtn;
     pane._stopBtn = stopBtn;
-
     return pane;
   }
 
+  function getInput(field) { return field.querySelector('input'); }
   function numInput(label, defVal) {
     const w = el('label', { class: 'xbot-field' });
     w.appendChild(el('span', {}, label));
     const inp = el('input', { type: 'number', class: 'xbot-input' });
-    inp.value = String(defVal);
-    w.appendChild(inp);
-    return w;
+    inp.value = String(defVal); w.appendChild(inp); return w;
   }
   function textInput(label, defVal) {
     const w = el('label', { class: 'xbot-field' });
     w.appendChild(el('span', {}, label));
     const inp = el('input', { type: 'text', class: 'xbot-input' });
-    inp.value = defVal;
-    w.appendChild(inp);
-    return w;
+    inp.value = defVal; w.appendChild(inp); return w;
   }
   function check(label, defVal) {
     const w = el('label', { class: 'xbot-check' });
     const inp = el('input', { type: 'checkbox' });
-    inp.checked = !!defVal;
-    w.appendChild(inp);
-    w.appendChild(el('span', {}, label));
-    return w;
+    inp.checked = !!defVal; w.appendChild(inp);
+    w.appendChild(el('span', {}, label)); return w;
   }
   const numVal = (w, def) => {
-    const v = parseInt(w.querySelector('input').value, 10);
+    const v = parseInt(getInput(w).value, 10);
     return Number.isFinite(v) ? v : def;
   };
-  const setNum = (w, v) => { w.querySelector('input').value = String(v); };
-  const checkVal = (w) => w.querySelector('input').checked;
-  const setCheck = (w, v) => { w.querySelector('input').checked = !!v; };
+  const setNum = (w, v) => { getInput(w).value = String(v); };
+  const checkVal = (w) => getInput(w).checked;
+  const setCheck = (w, v) => { getInput(w).checked = !!v; };
 
   // ---------- COMMENTS tab (kept) ----------
   function buildCommentsPane() {
-    const input = el('input', {
-      class: 'xbot-input',
-      placeholder: 'https://x.com/<user>/status/<id>  or just tweet id',
-    });
+    const input = el('input', { class: 'xbot-input',
+      placeholder: 'https://x.com/<user>/status/<id>  or just tweet id' });
     const fetchBtn = el('button', { class: 'xbot-btn' }, 'Load replies');
     const list = el('div', { class: 'xbot-list' });
-    const replyText = el('textarea', {
-      class: 'xbot-textarea',
-      placeholder: 'Reply text. Sent to whichever reply you click on.',
-    });
+    const replyText = el('textarea', { class: 'xbot-textarea',
+      placeholder: 'Reply text. Sent to whichever reply you click on.' });
     const error = el('div', { class: 'xbot-error' });
 
     fetchBtn.addEventListener('click', async () => {
-      error.textContent = '';
-      list.innerHTML = '';
+      error.textContent = ''; list.innerHTML = '';
       const m = input.value.match(TWEET_ID_RE);
       const id = m ? m[1] : input.value.trim();
       if (!/^\d+$/.test(id)) { error.textContent = 'Could not extract tweet id.'; return; }
@@ -269,8 +294,7 @@ const XBotModal = (() => {
 
     return el('div', { class: 'xbot-pane', 'data-pane': 'comments' },
       el('div', { class: 'xbot-row' }, input, fetchBtn),
-      replyText, error,
-      el('div', { style: 'height:8px' }), list,
+      replyText, error, el('div', { style: 'height:8px' }), list,
     );
   }
 
@@ -310,15 +334,15 @@ const XBotModal = (() => {
     const required = ['CreateTweet', 'SearchTimeline'];
     const ok = required.every((n) => captureState.ops && captureState.ops[n]);
     const badge = fab.querySelector('.xbot-badge');
+    badge.classList.remove('warn'); badge.classList.remove('run');
     if (autoState.status === 'running') {
       badge.textContent = String(autoState.sentInSession || 0);
-      badge.classList.remove('warn'); badge.classList.add('run');
+      badge.classList.add('run');
     } else if (ok) {
       badge.textContent = 'OK';
-      badge.classList.remove('warn'); badge.classList.remove('run');
     } else {
       badge.textContent = String(required.filter((n) => !captureState.ops[n]).length);
-      badge.classList.add('warn'); badge.classList.remove('run');
+      badge.classList.add('warn');
     }
     statusDot.className = 'xbot-dot';
     if (autoState.status === 'running') { statusDot.classList.add('run'); statusText.textContent = 'Auto-reply running'; }
@@ -330,8 +354,7 @@ const XBotModal = (() => {
 
   async function refreshAuto() {
     const [stateR, logsR] = await Promise.all([
-      send('auto.getState', {}),
-      send('auto.getLogs', {}),
+      send('auto.getState', {}), send('auto.getLogs', {}),
     ]);
     if (stateR.ok) autoState = stateR.data;
     const pane = root.querySelector('[data-pane="auto"]');
@@ -361,12 +384,12 @@ const XBotModal = (() => {
 
   async function refreshAll() {
     await Promise.all([refreshCapture(), refreshAuto()]);
-    if (!autoConfig) {
+    if (!autoConfigLoaded) {
       const cfgR = await send('auto.getConfig', {});
       if (cfgR.ok) {
-        autoConfig = cfgR.data;
+        autoConfigLoaded = true;
         const pane = root.querySelector('[data-pane="auto"]');
-        if (pane && pane._writeForm) pane._writeForm(autoConfig);
+        if (pane && pane._writeForm) pane._writeForm(cfgR.data);
       }
     }
   }
@@ -400,9 +423,7 @@ const XBotModal = (() => {
     }
 
     const body = el('div', { class: 'xbot-body' },
-      buildAutoPane(),
-      buildCommentsPane(),
-      buildStatusPane(),
+      buildAutoPane(), buildCommentsPane(), buildStatusPane(),
     );
 
     statusDot = el('span', { class: 'xbot-dot warn' });
@@ -422,7 +443,6 @@ const XBotModal = (() => {
     build();
     refreshAll();
     if (pollHandle) clearInterval(pollHandle);
-    // Poll less often when modal is closed; more often when open.
     pollHandle = setInterval(() => {
       if (modal.classList.contains('open')) refreshAll();
       else refreshCapture();
