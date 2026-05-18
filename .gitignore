@@ -3,6 +3,9 @@ node_modules/
 .vscode/
 *.log
 .env
-.env.*
+.env.local
+.env.*.local
+# but DO track example/template files
+!.env.example
 dist/
 build/
