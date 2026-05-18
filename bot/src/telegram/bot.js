@@ -17,6 +17,7 @@ import { db } from '../core/db.js';
 import { encryptJSON } from '../core/crypto.js';
 import { logger } from '../core/logger.js';
 import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS } from '../campaign/defaults.js';
+import { aiActivationSummary } from '../persona/persona.js';
 
 const PASSPHRASE = process.env.ENCRYPTION_PASSPHRASE;
 
@@ -135,10 +136,15 @@ function cmdStats(msg, id) {
   try { cfg = JSON.parse(c.config_json); } catch { cfg = {}; }
   const dailyEst = expectedDailyReplies(cfg);
   const cap = cfg?.pacing?.maxRepliesPerHour ?? '?';
+  const personaLabel = cfg?.persona?.name
+    ? `${cfg.persona.name}${cfg.persona.style ? ` (${cfg.persona.style.slice(0, 40)})` : ''}`
+    : '(neutral default)';
   bot.sendMessage(msg.chat.id,
     `#${id} "${c.name}" — ${c.status}\n` +
     `Sent total: ${c.sent_total}, last hour: ${lastHour}\n` +
     `Cap: ${cap}/h (~${dailyEst}/day with current sleep window)\n` +
+    `AI: ${aiActivationSummary()}\n` +
+    `Persona: ${personaLabel}\n` +
     `Last action: ${c.last_action_at ? new Date(c.last_action_at).toISOString() : 'never'}\n` +
     (c.last_error ? `⚠ ${c.last_error}` : ''));
 }
