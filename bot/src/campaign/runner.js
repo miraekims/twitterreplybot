@@ -43,6 +43,42 @@ const lastSearchEmpty = new Map();     // campaign_id → boolean (true = thrott
 const sleepLogTickedAt = new Map();    // campaign_id → timestamp ms (rate-limit sleep msgs)
 const bridgeWarnedAt = new Map();      // campaign_id → ts (last "bridge offline" warn)
 
+// Soft-ban detector: when X.com starts answering 404 to GraphQL endpoints
+// our account is on, hammering more requests just digs the hole deeper.
+// The "page-direct fetch from devtools also returns 404" symptom is a
+// strong WAF signal — there is nothing the code can do, only time helps.
+//
+// Strategy: count consecutive 404s per campaign. After 3 in a row, sleep
+// for 30 min. Each subsequent triplet doubles the sleep, capped at 4h.
+// On the FIRST successful (non-404) response, counter resets.
+const consecutive404 = new Map();      // campaign_id → count
+const banUntilMs = new Map();          // campaign_id → ts when we may try again
+const banLogTickedAt = new Map();      // campaign_id → ts (rate-limit ban msgs)
+
+function bumpBan(campaignId) {
+  const n = (consecutive404.get(campaignId) || 0) + 1;
+  consecutive404.set(campaignId, n);
+  if (n < 3) return null;
+  // 30min, 60min, 120min, 240min, capped.
+  const tier = Math.min(Math.floor(n / 3) - 1, 3);
+  const minutes = 30 * (2 ** tier);
+  const until = Date.now() + minutes * 60_000;
+  banUntilMs.set(campaignId, until);
+  return minutes;
+}
+
+function clearBan(campaignId) {
+  consecutive404.delete(campaignId);
+  banUntilMs.delete(campaignId);
+  banLogTickedAt.delete(campaignId);
+}
+
+// Public — Telegram /run uses this to give the user a way out of an
+// auto-applied soft-ban backoff without restarting the bot.
+export function clearSoftBan(campaignId) {
+  clearBan(campaignId);
+}
+
 export async function tickCampaign(campaign) {
   const cfg = JSON.parse(campaign.config_json);
 
@@ -67,6 +103,29 @@ export async function tickCampaign(campaign) {
       sleepLogTickedAt.set(campaign.id, Date.now());
     }
     return;
+  }
+
+  // Soft-ban backoff (3+ consecutive 404s from x.com)?
+  const banUntil = banUntilMs.get(campaign.id) || 0;
+  if (banUntil && Date.now() < banUntil) {
+    const last = banLogTickedAt.get(campaign.id) || 0;
+    if (Date.now() - last > 5 * 60_000) {
+      const minLeft = Math.ceil((banUntil - Date.now()) / 60_000);
+      logger.warn(
+        'runner',
+        `c${campaign.id} backoff after consecutive 404s — ${minLeft}min left. ` +
+        `If x.com search works in your browser, run /pause then /run to clear it.`,
+        campaign.id,
+      );
+      banLogTickedAt.set(campaign.id, Date.now());
+    }
+    return;
+  } else if (banUntil) {
+    // Backoff just elapsed — try once and if it 404s again the counter
+    // is still non-zero, so the next 404 immediately re-arms a longer ban.
+    banUntilMs.delete(campaign.id);
+    banLogTickedAt.delete(campaign.id);
+    logger.info('runner', `c${campaign.id} resuming after soft-ban backoff`, campaign.id);
   }
 
   // Hourly cap (token bucket)?
@@ -95,6 +154,11 @@ export async function tickCampaign(campaign) {
       lastSearchEmpty.set(campaign.id, queue.length === 0);
       db.bumpCampaignAction(campaign.id, 'search');
       logger.info('runner', `c${campaign.id} search → ${queue.length} usable`, campaign.id);
+      // Any non-throwing search success counts as recovery. (404s are
+      // counted/escalated inside runSearchPhase via the catch path.)
+      if (queue.length > 0 && consecutive404.get(campaign.id)) {
+        clearBan(campaign.id);
+      }
     } catch (e) {
       logger.error('runner', `c${campaign.id} search: ${e.message}`, campaign.id);
       // BRIDGE_DISCONNECTED means Chrome went away mid-call. Don't escalate
@@ -159,18 +223,48 @@ export async function tickCampaign(campaign) {
 async function runSearchPhase(client, campaign, cfg) {
   const all = [];
   const seen = new Set();
+  // Track 404s within this search batch. The first 404 is logged but we
+  // continue; the second consecutive 404 in the same batch breaks the
+  // loop early so we don't issue 5+ doomed requests when x.com has
+  // already decided to soft-ban us. Cross-batch counting lives in
+  // consecutive404 / bumpBan().
+  let kw404Streak = 0;
   for (const kw of cfg.keywords) {
     try {
       const { tweets } = await client.searchTimeline({ query: kw });
       for (const t of tweets) {
         if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _kw: kw }); }
       }
+      kw404Streak = 0;
     } catch (e) {
       // Hard errors (bridge down, auth, rate limit) bubble up so the
       // caller can break the loop and decide what to do.
       if (e.code === 'BRIDGE_DISCONNECTED') throw e;
       if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
+      // 404 (or anything else) — log, count, and break early on a streak.
       logger.warn('runner', `c${campaign.id} search "${kw}": ${e.message}`, campaign.id);
+      if (e.status === 404) {
+        kw404Streak++;
+        const wait = bumpBan(campaign.id);
+        if (wait != null) {
+          logger.warn(
+            'runner',
+            `c${campaign.id} soft-ban backoff: ${wait}min — too many 404s in a row. ` +
+            `Likely x.com rate-limited the account. Try a real search in the browser ` +
+            `to verify; if THAT 404s too, leave the account alone for an hour.`,
+            campaign.id,
+          );
+          break;
+        }
+        if (kw404Streak >= 2) {
+          logger.warn(
+            'runner',
+            `c${campaign.id} two keywords in a row 404'd, skipping rest of batch`,
+            campaign.id,
+          );
+          break;
+        }
+      }
     }
     await sleep(800 + Math.random() * 800);
   }

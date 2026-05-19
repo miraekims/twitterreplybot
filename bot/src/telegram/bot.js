@@ -25,6 +25,7 @@ import { logger } from '../core/logger.js';
 import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS } from '../campaign/defaults.js';
 import { aiActivationSummary } from '../persona/persona.js';
 import { bridge } from '../bridge/server.js';
+import { clearSoftBan } from '../campaign/runner.js';
 
 let bot;
 const conversations = new Map(); // chatId → { kind, step, draft }
@@ -224,6 +225,10 @@ function cmdRun(msg, id) {
       '⚠ Bridge not connected. Campaign will idle until Chrome extension attaches.\n' +
       'Use /connect to wait for it, or just start Chrome — the campaign will pick up automatically.');
   }
+  // Clear any soft-ban backoff state from prior 404 storm. The user's
+  // explicit /run is a signal to retry immediately; if the ban is real
+  // x.com will 404 again and we'll re-arm.
+  clearSoftBan(id);
   db.setCampaignStatus(id, 'running');
   bot.sendMessage(msg.chat.id, `▶ campaign #${id} running`);
 }
