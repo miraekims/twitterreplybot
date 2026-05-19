@@ -24,6 +24,7 @@ import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
 import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS, stepKeywordsHelp } from '../campaign/defaults.js';
 import { aiActivationSummary } from '../persona/persona.js';
+import { PERSONA_PRESETS, getPreset, buildPersonaPresetKeyboard } from '../persona/presets.js';
 import { bridge } from '../bridge/server.js';
 import { clearSoftBan } from '../campaign/runner.js';
 import { setNotifier } from '../core/notify.js';
@@ -70,6 +71,7 @@ export function startTelegram() {
   bot.onText(/^\/preset(?:\s+(\d+)\s+(\w+))?/, (m, mt) => guard(m, () => cmdPreset(m, mt[1] && +mt[1], mt[2])));
   bot.onText(/^\/sleep\s+(\d+)\s+(on|off)$/, (m, mt) => guard(m, () => cmdSleep(m, +mt[1], mt[2])));
   bot.onText(/^\/diag(?:nose)?(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdDiagnose(m, mt[1] && +mt[1])));
+  bot.onText(/^\/menu$/, (m) => guard(m, () => cmdMenu(m)));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
   bot.on('callback_query', (q) => handleCallback(q).catch((e) => {
     logger.warn('tg', `callback: ${e && e.message}`);
@@ -140,6 +142,7 @@ const HELP = [
   '',
   '/connect — wait for the Chrome extension to attach',
   '/accounts — list connected X account(s)',
+  '/menu — main menu (campaigns, settings, personas, posts, diagnose)',
   '/new — create a campaign (keywords + templates + persona)',
   '/campaigns (alias /list) — list campaigns with action buttons',
   '/run <id>, /pause <id>, /stop <id>',
@@ -158,6 +161,7 @@ const HELP = [
 const COMMAND_LIST = [
   { command: 'connect', description: 'Attach Chrome extension' },
   { command: 'accounts', description: 'Show connected X accounts' },
+  { command: 'menu', description: 'Main menu — sectioned navigator' },
   { command: 'new', description: 'Create a new campaign' },
   { command: 'campaigns', description: 'List campaigns + action buttons' },
   { command: 'list', description: 'Alias for /campaigns' },
@@ -514,25 +518,43 @@ function stepNewCampaign(msg, conv) {
     }
     conv.step = 'persona';
     return bot.sendMessage(msg.chat.id,
-      'Persona (one line, "name | bio | style") or "skip" to use plain templates.\n' +
-      'Example: "Alex | 3y crypto, lost 2 portfolios | cynical, lowercase, dry humor"');
+      'Persona — pick a preset or type your own as "name | bio | style".\n\n' +
+      'Presets ship with bio + style + 10 example tweet→reply pairs ' +
+      'that drive AI voice fidelity (examples are 3-5x stronger than ' +
+      'bio/style alone). See bot/personas/PRESETS.md for what each one ' +
+      'is best at.\n\n' +
+      'Tap a button below, or type your own.',
+      { reply_markup: { inline_keyboard: buildPersonaPresetKeyboard() } });
   }
   if (conv.step === 'persona') {
     if (text.toLowerCase() !== 'skip') {
       const [name, bio, style] = text.split('|').map((s) => s.trim());
       cfg.persona = { name, bio, style, examples: [] };
     }
-    const id = db.insertCampaign({
-      account_id: conv.draft.account_id,
-      name: conv.draft.name,
-      config_json: JSON.stringify(cfg),
-    });
-    conversations.delete(msg.chat.id);
-    return bot.sendMessage(msg.chat.id,
-      `✓ Campaign #${id} "${conv.draft.name}" created.\n` +
-      `Defaults: max ${cfg.pacing.maxRepliesPerHour}/h, delay ${cfg.pacing.minDelaySec}-${cfg.pacing.maxDelaySec}s.\n` +
-      `Use /run ${id} to start.`);
+    return finalizeNewCampaign(msg.chat.id, conv);
   }
+}
+
+// Finalize the /new flow — separated so both the text-typed path and
+// the preset-button callback path land in the same code without
+// duplicating the DB insert + reply.
+function finalizeNewCampaign(chatId, conv) {
+  const cfg = conv.draft.config;
+  const id = db.insertCampaign({
+    account_id: conv.draft.account_id,
+    name: conv.draft.name,
+    config_json: JSON.stringify(cfg),
+  });
+  conversations.delete(chatId);
+  const personaSummary = cfg.persona && cfg.persona.name
+    ? `persona: ${cfg.persona.name}` +
+      (cfg.persona.examples?.length ? ` (${cfg.persona.examples.length} examples)` : '')
+    : 'persona: (neutral default)';
+  return bot.sendMessage(chatId,
+    `✓ Campaign #${id} "${conv.draft.name}" created.\n` +
+    `${personaSummary}\n` +
+    `Defaults: max ${cfg.pacing.maxRepliesPerHour}/h, delay ${cfg.pacing.minDelaySec}-${cfg.pacing.maxDelaySec}s.\n` +
+    `Use /run ${id} to start, or /menu for the main panel.`);
 }
 
 
@@ -691,6 +713,16 @@ async function handleCallback(q) {
       case 'sleep':
         cmdSleep(fakeMsg, id, arg);
         break;
+      case 'ppreset':
+        // Persona preset picker from /new flow. The "id" slot here is
+        // actually the preset id (string), and "arg" is unused — we
+        // override the split because preset ids contain underscores
+        // and we treat the whole second segment as the preset key.
+        await handlePersonaPresetPick(q, idStr);
+        break;
+      case 'menu':
+        await handleMenuClick(q, idStr);
+        break;
       default:
         await bot.answerCallbackQuery(q.id, { text: `Unknown action: ${action}` });
         return;
@@ -739,4 +771,152 @@ function parseTemplateLine(line) {
     ? tagsStr.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
     : [];
   return { match, text };
+}
+
+
+// ---------- persona preset picker ----------
+//
+// Triggered when the user taps one of the inline buttons rendered at
+// the persona step in /new. callback_data is "ppreset:<presetId>",
+// where presetId is one of:
+//   - a registered preset id (veteran/quant/sol_degen/macro/builder/contrarian)
+//   - "custom"  → fall through to the existing text-typed path
+//   - "skip"    → finalize without persona
+//
+// We deliberately do NOT mutate the original /new message — we only
+// append a small confirmation. The flow's invariants (conversation
+// state, finalize codepath) stay intact even if the user hits the
+// wrong button: the state machine simply waits for the next event.
+async function handlePersonaPresetPick(q, presetId) {
+  const chatId = q.message.chat.id;
+  const conv = conversations.get(chatId);
+  if (!conv || conv.kind !== 'newCampaign' || conv.step !== 'persona') {
+    return bot.sendMessage(chatId,
+      'No campaign is awaiting a persona right now. Use /new to start one.');
+  }
+
+  if (presetId === 'skip') {
+    // No persona at all — runner falls back to the neutral default
+    // voice in persona.js. AI rewriting still runs if OPENAI_API_KEY
+    // is set; we just don't bias it.
+    return finalizeNewCampaign(chatId, conv);
+  }
+
+  if (presetId === 'custom') {
+    // Keep the conversation in 'persona' step; the text handler in
+    // stepNewCampaign already accepts "name | bio | style". Just
+    // remind the user what the format looks like.
+    return bot.sendMessage(chatId,
+      'Type your persona as: "name | bio | style".\n' +
+      'Example: "Alex | 3y crypto, lost 2 portfolios | cynical, lowercase, dry humor"\n\n' +
+      'Or type "skip" to skip persona entirely.');
+  }
+
+  const persona = getPreset(presetId);
+  if (!persona) {
+    return bot.sendMessage(chatId,
+      `Unknown preset "${presetId}". Use /new to retry.`);
+  }
+  conv.draft.config.persona = persona;
+  await bot.sendMessage(chatId,
+    `Loaded preset: ${persona.name} (${persona.examples?.length || 0} examples).`);
+  return finalizeNewCampaign(chatId, conv);
+}
+
+// ---------- main menu (/menu) ----------
+//
+// Replaces the "memorize 14 slash commands" UX with a sectioned
+// inline-keyboard navigator. All existing slash commands continue
+// to work — /menu is purely additive.
+//
+// Sections:
+//   📣 Campaigns — list, run/pause/stop, stats
+//   ⚙ Settings  — pacing preset, sleep window, filters (planned PR2)
+//   🎭 Personas  — browse presets, swap mid-campaign (planned PR2)
+//   📝 Posts     — auto-post engine (planned PR4: drafts, schedule)
+//   🩺 Diagnose — bridge + GraphQL op health
+//   ❓ Help      — full text help
+//
+// Sub-section openers wired here jump straight into existing cmd*
+// functions. Sections marked "planned" surface a coming-soon note
+// so the menu renders complete from day one and we don't ship empty
+// branches.
+function buildMainMenuKeyboard() {
+  return [
+    [
+      { text: '📣 Campaigns', callback_data: 'menu:campaigns' },
+      { text: '⚙ Settings',   callback_data: 'menu:settings' },
+    ],
+    [
+      { text: '🎭 Personas',  callback_data: 'menu:personas' },
+      { text: '📝 Posts',     callback_data: 'menu:posts' },
+    ],
+    [
+      { text: '🩺 Diagnose',  callback_data: 'menu:diagnose' },
+      { text: '❓ Help',       callback_data: 'menu:help' },
+    ],
+  ];
+}
+
+function cmdMenu(msg) {
+  const bs = bridge.status();
+  const bridgeLine = bs.connected
+    ? `Bridge: ✓ @${bs.handle || '?'}`
+    : 'Bridge: ✗ disconnected';
+  return bot.sendMessage(msg.chat.id,
+    'X Reply Bot — main menu\n' +
+    bridgeLine + '\n\n' +
+    'Pick a section:',
+    { reply_markup: { inline_keyboard: buildMainMenuKeyboard() } });
+}
+
+async function handleMenuClick(q, section) {
+  const fakeMsg = {
+    from: q.from,
+    chat: q.message.chat,
+    message_id: q.message.message_id,
+  };
+  switch (section) {
+    case 'campaigns':
+      return cmdCampaigns(fakeMsg);
+    case 'settings':
+      return bot.sendMessage(q.message.chat.id,
+        '⚙ Settings — per-campaign\n\n' +
+        'Pick a campaign first via 📣 Campaigns, then use:\n' +
+        '  /preset <id> safe|medium|highvolume — pacing\n' +
+        '  /sleep <id> on|off — quiet hours\n\n' +
+        'Granular settings panel (likes threshold, follower threshold, ' +
+        'language filter, skip replies/retweets) is in PR2 — see ' +
+        'bot/ROADMAP.md.');
+    case 'personas':
+      return bot.sendMessage(q.message.chat.id,
+        '🎭 Personas\n\n' +
+        PERSONA_PRESETS.map((p) =>
+          `${p.label} — ${p.description}`,
+        ).join('\n\n') +
+        '\n\nPersonas are picked at /new time. Mid-campaign swap is ' +
+        'planned for PR2.');
+    case 'posts':
+      return bot.sendMessage(q.message.chat.id,
+        '📝 Posts — auto-post engine\n\n' +
+        'Status: planned for PR4 (see bot/ROADMAP.md).\n\n' +
+        'Why it matters: ER (engagement rate) is largely a function of ' +
+        'reply-to-original ratio. Accounts that only reply trip spam-' +
+        'class detection. Posting 3-10 originals per day is the actual ' +
+        'fix.\n\n' +
+        'Coming in PR4:\n' +
+        '  • /draft — generate 3 candidate posts from current trends\n' +
+        '  • /post — manual one-shot post\n' +
+        '  • /queue — schedule, reorder, cancel\n' +
+        '  • Anti-bot pacing (irregular gaps 30min-4h, sleep-aware)\n' +
+        '  • Hit-detection: replies that get ≥5 likes auto-suggest a ' +
+        'top-level post developing the same idea');
+    case 'diagnose':
+      return cmdDiagnose(fakeMsg);
+    case 'help':
+      return sendEphemeral(fakeMsg, HELP);
+    default:
+      return bot.sendMessage(q.message.chat.id,
+        `Unknown menu section: ${section}`);
+  }
 }
