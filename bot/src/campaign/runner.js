@@ -6,27 +6,41 @@
 //   2. sleep window? → bail
 //   3. hourly cap reached? → bail
 //   4. cooldown since last action not elapsed? → bail
-//   5. queue empty + searchEverySec elapsed? → search, refill queue
+//   5. queue empty + scrollEverySec elapsed? → fetch next HomeTimeline
+//      page, filter locally by keywords, push to queue
 //   6. queue has items? → reply to next tweet, dedup-mark
 //
+// Why HomeTimeline + local filtering instead of SearchTimeline:
+//
+//   We tried SearchTimeline first (one search per keyword per cycle). X
+//   soft-banned the account inside an hour: every /graphql/.../SearchTimeline
+//   started returning HTTP 404 with empty body, even direct fetches from
+//   the user's own browser DevTools. SearchTimeline is treated as a
+//   "rare ad-hoc" endpoint by X — real users only search a handful of
+//   times per day, so anything above ~30 calls/h trips its WAF.
+//
+//   HomeTimeline is the every-scroll feed endpoint. Real users hit it
+//   constantly (every refresh, every infinite-scroll). For a well-curated
+//   account (here: 1129 follows in the crypto industry) the home feed IS
+//   already keyword-filtered by the people the user chose to follow.
+//   We pull a page (~40 tweets), filter locally for our keywords, push
+//   the matches to the reply queue. X never sees what we're "searching"
+//   for — it just sees a feed scroll, which is the most common thing on
+//   the platform.
+//
 // Throughput notes (re: 1000-replies/day target):
-//   - The supervisor wakes every 5s, so the actual-vs-configured cooldown
-//     has up to ~2.5s slop per reply. At 1000/day that's ~42min/day of
-//     unrecoverable slop, baked into the math in defaults.js.
 //   - Cooldown is rolled ONCE per reply (stored in `nextEligibleAt`), not
 //     re-rolled on every tick. Re-rolling per-tick was non-monotonic and
 //     dropped effective throughput.
-//   - When the queue is empty, we search immediately if the last search was
-//     productive. Only when consecutive searches return empty do we fall
-//     back to the configured `searchEverySec` throttle.
+//   - HomeTimeline page = ~40 tweets. Even with strict keyword filters
+//     5-10 typically match, which feeds the queue ahead of the reply
+//     pace easily.
 //
 // Bridge note: with the Chrome-bridge architecture, `account_id` no longer
 // uniquely identifies a session — the extension is global per Chrome
 // install, and the connected handle is whichever account is logged into
 // x.com in that Chrome. We still keep account_id on campaigns for now, but
-// every campaign effectively shares the same upstream session. Multi-
-// account support would need either multiple Chrome profiles or per-handle
-// routing through the bridge; explicit non-goal at v0.1.
+// every campaign effectively shares the same upstream session.
 import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
 import { XClient } from '../x/client.js';
@@ -39,27 +53,28 @@ import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
 // in SQLite still bounds it.
 const queues = new Map();              // campaign_id → tweet[]
 const nextEligibleAt = new Map();      // campaign_id → timestamp ms
-const lastSearchEmpty = new Map();     // campaign_id → boolean (true = throttle)
+const lastScrollEmpty = new Map();     // campaign_id → boolean (true = throttle next scroll)
 const sleepLogTickedAt = new Map();    // campaign_id → timestamp ms (rate-limit sleep msgs)
 const bridgeWarnedAt = new Map();      // campaign_id → ts (last "bridge offline" warn)
+// HomeTimeline cursor for incremental scroll. When nextCursor returns null
+// (end of available feed) or a scan returns 0 fresh tweets twice in a row,
+// we reset to null and start from the top — same behavior as the X UI's
+// pull-to-refresh.
+const scrollCursor = new Map();        // campaign_id → opaque cursor string
+const emptyScrollStreak = new Map();   // campaign_id → count
 
-// Soft-ban detector: when X.com starts answering 404 to GraphQL endpoints
-// our account is on, hammering more requests just digs the hole deeper.
-// The "page-direct fetch from devtools also returns 404" symptom is a
-// strong WAF signal — there is nothing the code can do, only time helps.
-//
-// Strategy: count consecutive 404s per campaign. After 3 in a row, sleep
-// for 30 min. Each subsequent triplet doubles the sleep, capped at 4h.
-// On the FIRST successful (non-404) response, counter resets.
-const consecutive404 = new Map();      // campaign_id → count
-const banUntilMs = new Map();          // campaign_id → ts when we may try again
-const banLogTickedAt = new Map();      // campaign_id → ts (rate-limit ban msgs)
+// Soft-ban detector. Mostly a safety net now that we use HomeTimeline,
+// which is the most-used endpoint on x.com — getting 404s from it would
+// suggest something more serious than ad-hoc rate-limiting. We still
+// detect and back off so a misbehaving bot can't keep hitting a wall.
+const consecutive404 = new Map();
+const banUntilMs = new Map();
+const banLogTickedAt = new Map();
 
 function bumpBan(campaignId) {
   const n = (consecutive404.get(campaignId) || 0) + 1;
   consecutive404.set(campaignId, n);
   if (n < 3) return null;
-  // 30min, 60min, 120min, 240min, capped.
   const tier = Math.min(Math.floor(n / 3) - 1, 3);
   const minutes = 30 * (2 ** tier);
   const until = Date.now() + minutes * 60_000;
@@ -73,8 +88,6 @@ function clearBan(campaignId) {
   banLogTickedAt.delete(campaignId);
 }
 
-// Public — Telegram /run uses this to give the user a way out of an
-// auto-applied soft-ban backoff without restarting the bot.
 export function clearSoftBan(campaignId) {
   clearBan(campaignId);
 }
@@ -82,9 +95,6 @@ export function clearSoftBan(campaignId) {
 export async function tickCampaign(campaign) {
   const cfg = JSON.parse(campaign.config_json);
 
-  // Bridge offline? Idle silently — don't roll cooldowns, don't burn
-  // hourly bucket, don't call client. Logging is rate-limited so we don't
-  // spam every 5s when Chrome is closed.
   if (!bridge.isConnected()) {
     const last = bridgeWarnedAt.get(campaign.id) || 0;
     if (Date.now() - last > 5 * 60_000) {
@@ -94,7 +104,6 @@ export async function tickCampaign(campaign) {
     return;
   }
 
-  // Sleep window?
   const sleepRemain = inSleepWindow(cfg.sleep);
   if (sleepRemain != null) {
     const last = sleepLogTickedAt.get(campaign.id) || 0;
@@ -105,7 +114,6 @@ export async function tickCampaign(campaign) {
     return;
   }
 
-  // Soft-ban backoff (3+ consecutive 404s from x.com)?
   const banUntil = banUntilMs.get(campaign.id) || 0;
   if (banUntil && Date.now() < banUntil) {
     const last = banLogTickedAt.get(campaign.id) || 0;
@@ -114,57 +122,46 @@ export async function tickCampaign(campaign) {
       logger.warn(
         'runner',
         `c${campaign.id} backoff after consecutive 404s — ${minLeft}min left. ` +
-        `If x.com search works in your browser, run /pause then /run to clear it.`,
+        `If x.com works in your browser, /pause then /run to clear.`,
         campaign.id,
       );
       banLogTickedAt.set(campaign.id, Date.now());
     }
     return;
   } else if (banUntil) {
-    // Backoff just elapsed — try once and if it 404s again the counter
-    // is still non-zero, so the next 404 immediately re-arms a longer ban.
     banUntilMs.delete(campaign.id);
     banLogTickedAt.delete(campaign.id);
     logger.info('runner', `c${campaign.id} resuming after soft-ban backoff`, campaign.id);
   }
 
-  // Hourly cap (token bucket)?
   const sentLastHour = db.countSentLastHour(campaign.id);
   if (sentLastHour >= (cfg.pacing.maxRepliesPerHour || 15)) {
-    return; // Will be re-checked next tick.
+    return;
   }
 
-  // Cooldown since last action? Use the eligibility timestamp set after the
-  // PREVIOUS reply. If nothing scheduled, we're eligible now.
   const eligibleAt = nextEligibleAt.get(campaign.id) || 0;
   if (Date.now() < eligibleAt) return;
 
   const client = new XClient({ lang: cfg.lang || 'en' });
 
-  // Search if queue empty.
+  // Refill queue from HomeTimeline if empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
-    if (lastSearchEmpty.get(campaign.id)) {
-      const sinceSearch = Date.now() - (campaign.last_search_at || 0);
-      if (campaign.last_search_at && sinceSearch < (cfg.pacing.searchEverySec || 180) * 1000) return;
+    if (lastScrollEmpty.get(campaign.id)) {
+      const sinceScroll = Date.now() - (campaign.last_search_at || 0);
+      if (campaign.last_search_at && sinceScroll < (cfg.pacing.searchEverySec || 90) * 1000) return;
     }
     try {
-      queue = await runSearchPhase(client, campaign, cfg);
+      queue = await runFeedScan(client, campaign, cfg);
       queues.set(campaign.id, queue);
-      lastSearchEmpty.set(campaign.id, queue.length === 0);
+      lastScrollEmpty.set(campaign.id, queue.length === 0);
       db.bumpCampaignAction(campaign.id, 'search');
-      logger.info('runner', `c${campaign.id} search → ${queue.length} usable`, campaign.id);
-      // Any non-throwing search success counts as recovery. (404s are
-      // counted/escalated inside runSearchPhase via the catch path.)
+      logger.info('runner', `c${campaign.id} feed scan → ${queue.length} matches`, campaign.id);
       if (queue.length > 0 && consecutive404.get(campaign.id)) {
         clearBan(campaign.id);
       }
     } catch (e) {
-      logger.error('runner', `c${campaign.id} search: ${e.message}`, campaign.id);
-      // BRIDGE_DISCONNECTED means Chrome went away mid-call. Don't escalate
-      // to error status — we'll just retry on the next tick when bridge is
-      // back. Auth/rate-limit codes from x.com still hard-stop the
-      // campaign so we don't spam into a wall.
+      logger.error('runner', `c${campaign.id} feed scan: ${e.message}`, campaign.id);
       if (e.code === 'BRIDGE_DISCONNECTED') return;
       if (e.status === 401 || e.status === 403 || e.status === 429) {
         db.setCampaignStatus(campaign.id, 'error', e.message);
@@ -192,8 +189,6 @@ export async function tickCampaign(campaign) {
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
 
-  // Schedule next-eligible BEFORE the network call so a hung call doesn't
-  // queue a duplicate on the next tick.
   const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
   nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
 
@@ -202,95 +197,112 @@ export async function tickCampaign(campaign) {
     db.markSent(campaign.id, t.id);
     db.bumpCampaignAction(campaign.id, 'reply');
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
-    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})`, campaign.id);
+    const kw = t._matchedKeyword ? ` [kw="${t._matchedKeyword}"]` : '';
+    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})${kw}`, campaign.id);
   } catch (e) {
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     logger.error('runner', `c${campaign.id} reply ${t.id} (${who}): ${e.message}`, campaign.id);
     if (e.code === 'BRIDGE_DISCONNECTED') {
-      // Don't mark sent — extension never sent the reply. Push the tweet
-      // back to the front so the next tick (with bridge restored) tries it.
       queue.unshift(t);
       queues.set(campaign.id, queue);
       return;
     }
-    db.markSent(campaign.id, t.id); // don't retry the same broken tweet
+    db.markSent(campaign.id, t.id);
     if (e.status === 401 || e.status === 403 || e.status === 429) {
       db.setCampaignStatus(campaign.id, 'error', e.message);
     }
   }
 }
 
-async function runSearchPhase(client, campaign, cfg) {
-  const all = [];
-  const seen = new Set();
-  // Track 404s within this search batch. The first 404 is logged but we
-  // continue; the second consecutive 404 in the same batch breaks the
-  // loop early so we don't issue 5+ doomed requests when x.com has
-  // already decided to soft-ban us. Cross-batch counting lives in
-  // consecutive404 / bumpBan().
-  let kw404Streak = 0;
-  for (const kw of cfg.keywords) {
-    try {
-      const { tweets } = await client.searchTimeline({ query: kw });
-      for (const t of tweets) {
-        if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _kw: kw }); }
+// Pull one HomeTimeline page (advancing the per-campaign cursor), filter
+// locally by cfg.keywords + cfg.filters. Returns the matched tweets.
+async function runFeedScan(client, campaign, cfg) {
+  const cursor = scrollCursor.get(campaign.id) || null;
+  let resp;
+  try {
+    resp = await client.homeTimeline({ cursor, count: 40 });
+  } catch (e) {
+    if (e.code === 'BRIDGE_DISCONNECTED') throw e;
+    if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
+    if (e.status === 404) {
+      const wait = bumpBan(campaign.id);
+      if (wait != null) {
+        logger.warn(
+          'runner',
+          `c${campaign.id} soft-ban backoff: ${wait}min — HomeTimeline 404. ` +
+          `Verify x.com works in your browser before /run.`,
+          campaign.id,
+        );
       }
-      kw404Streak = 0;
-    } catch (e) {
-      // Hard errors (bridge down, auth, rate limit) bubble up so the
-      // caller can break the loop and decide what to do.
-      if (e.code === 'BRIDGE_DISCONNECTED') throw e;
-      if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
-      // 404 (or anything else) — log, count, and break early on a streak.
-      logger.warn('runner', `c${campaign.id} search "${kw}": ${e.message}`, campaign.id);
-      if (e.status === 404) {
-        kw404Streak++;
-        const wait = bumpBan(campaign.id);
-        if (wait != null) {
-          logger.warn(
-            'runner',
-            `c${campaign.id} soft-ban backoff: ${wait}min — too many 404s in a row. ` +
-            `Likely x.com rate-limited the account. Try a real search in the browser ` +
-            `to verify; if THAT 404s too, leave the account alone for an hour.`,
-            campaign.id,
-          );
-          break;
-        }
-        if (kw404Streak >= 2) {
-          logger.warn(
-            'runner',
-            `c${campaign.id} two keywords in a row 404'd, skipping rest of batch`,
-            campaign.id,
-          );
-          break;
-        }
-      }
+      throw e;
     }
-    await sleep(800 + Math.random() * 800);
+    throw e;
   }
 
-  // Filter — track drops for diagnostics. If a non-trivial fraction of
-  // tweets is dropped solely for missing authorHandle, that's our canary
-  // for X having silently changed the user-result shape again.
+  // Advance cursor for next call. If the API returned no fresh cursor or
+  // we got an empty page twice, reset to top of feed (mimics pull-to-refresh).
+  const newCursor = resp.nextCursor;
+  if (!resp.tweets || resp.tweets.length === 0) {
+    const streak = (emptyScrollStreak.get(campaign.id) || 0) + 1;
+    emptyScrollStreak.set(campaign.id, streak);
+    if (streak >= 2) {
+      scrollCursor.delete(campaign.id);
+      emptyScrollStreak.set(campaign.id, 0);
+      logger.info('runner', `c${campaign.id} feed exhausted, reset to top`, campaign.id);
+    } else if (newCursor) {
+      scrollCursor.set(campaign.id, newCursor);
+    }
+  } else {
+    emptyScrollStreak.set(campaign.id, 0);
+    if (newCursor) scrollCursor.set(campaign.id, newCursor);
+  }
+
+  // Local keyword match. cfg.keywords are now plain substrings (e.g.
+  // "solana", "gm crypto"). We treat each entry as a case-insensitive
+  // substring match against tweet text. Multi-word entries match if all
+  // words appear (in any order) — this lets you say "gm crypto" without
+  // it requiring those exact tokens adjacent.
+  const keywords = (cfg.keywords || []).map((k) => k.trim()).filter(Boolean);
   let droppedNoHandle = 0;
+  let droppedNoMatch = 0;
   const passed = [];
-  for (const t of all) {
+  for (const t of resp.tweets || []) {
     if (!t || !t.id || !t.text) continue;
     if (!t.authorHandle) { droppedNoHandle++; continue; }
+    const matched = matchKeyword(t.text, keywords);
+    if (!matched) { droppedNoMatch++; continue; }
     if (!passesFilters(t, cfg.filters)) continue;
     if (db.isSent(campaign.id, t.id)) continue;
+    t._matchedKeyword = matched;
     passed.push(t);
   }
-  if (droppedNoHandle > 0 && all.length > 0) {
-    const pct = Math.round((droppedNoHandle / all.length) * 100);
-    const fn = pct > 30 ? 'warn' : 'info';
-    logger[fn](
+  if ((resp.tweets || []).length > 0) {
+    logger.info(
       'runner',
-      `c${campaign.id} dropped ${droppedNoHandle}/${all.length} tweets with no handle (${pct}%)`,
+      `c${campaign.id} feed page: ${resp.tweets.length} tweets, ${passed.length} kw-matched, ` +
+      `${droppedNoMatch} no-match, ${droppedNoHandle} no-handle`,
       campaign.id,
     );
   }
   return passed;
+}
+
+// Match tweet text against the keyword list. Each keyword is a string;
+// multi-word entries require all words to appear in text (case-insensitive).
+// Returns the matched keyword string or null.
+function matchKeyword(text, keywords) {
+  if (!keywords || keywords.length === 0) {
+    // Empty keyword list = match everything. Useful for "reply to anything
+    // in my feed" mode.
+    return '*';
+  }
+  const lower = text.toLowerCase();
+  for (const kw of keywords) {
+    const tokens = kw.toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+    if (tokens.every((tok) => lower.includes(tok))) return kw;
+  }
+  return null;
 }
 
 function passesFilters(t, f) {
@@ -353,4 +365,3 @@ function parseHHMM(s) {
   const m = String(s || '').match(/^(\d{1,2}):(\d{2})$/);
   return m ? (+m[1]) * 60 + (+m[2]) : null;
 }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
