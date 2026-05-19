@@ -54,6 +54,18 @@ export const db = {
         PRIMARY KEY (campaign_id, tweet_id)
       );
 
+      -- Per-author cooldown — last time we replied to a given @handle in
+      -- a given campaign. Used to throttle "one reply per author per N
+      -- hours" so the bot doesn't dogpile a single user's tweets when
+      -- several of theirs hit the home feed in quick succession.
+      -- Handles are stored lower-cased; X handles are case-insensitive.
+      CREATE TABLE IF NOT EXISTS author_replies (
+        campaign_id INTEGER NOT NULL,
+        author_handle TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        PRIMARY KEY (campaign_id, author_handle)
+      );
+
       CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         campaign_id INTEGER,
@@ -117,6 +129,28 @@ export const db = {
   countSentLastHour(campaign_id) {
     const cutoff = Date.now() - 60 * 60 * 1000;
     return _db.prepare(`SELECT COUNT(*) AS n FROM sent WHERE campaign_id = ? AND ts >= ?`).get(campaign_id, cutoff).n;
+  },
+
+  // ---------- per-author cooldown ----------
+  // Returns the ts of the last reply we sent to this author in this
+  // campaign, or 0 if we've never replied to them. Handles are
+  // normalized to lowercase before lookup/storage.
+  lastAuthorReplyTs(campaign_id, handle) {
+    if (!handle) return 0;
+    const h = String(handle).toLowerCase();
+    const row = _db.prepare(
+      `SELECT ts FROM author_replies WHERE campaign_id = ? AND author_handle = ?`,
+    ).get(campaign_id, h);
+    return row ? row.ts : 0;
+  },
+  markAuthorReplied(campaign_id, handle) {
+    if (!handle) return;
+    const h = String(handle).toLowerCase();
+    _db.prepare(
+      `INSERT INTO author_replies (campaign_id, author_handle, ts)
+         VALUES (?, ?, ?)
+       ON CONFLICT(campaign_id, author_handle) DO UPDATE SET ts = excluded.ts`,
+    ).run(campaign_id, h, Date.now());
   },
 
   // ---------- logs ----------
