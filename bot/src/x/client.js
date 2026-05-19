@@ -35,6 +35,10 @@ export class XClient {
     return rpc('x.searchTimeline', { query });
   }
 
+  async homeTimeline({ cursor = null, count = 40 } = {}) {
+    return rpc('x.homeTimeline', { cursor, count });
+  }
+
   async createTweet({ text, replyToTweetId }) {
     return rpc('x.createTweet', { text, replyToTweetId });
   }

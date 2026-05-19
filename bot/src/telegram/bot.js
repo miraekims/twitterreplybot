@@ -22,9 +22,10 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
-import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS } from '../campaign/defaults.js';
+import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS, stepKeywordsHelp } from '../campaign/defaults.js';
 import { aiActivationSummary } from '../persona/persona.js';
 import { bridge } from '../bridge/server.js';
+import { clearSoftBan } from '../campaign/runner.js';
 
 let bot;
 const conversations = new Map(); // chatId → { kind, step, draft }
@@ -54,6 +55,7 @@ export function startTelegram() {
   bot.onText(/^\/stats\s+(\d+)/, (m, mt) => guard(m, () => cmdStats(m, +mt[1])));
   bot.onText(/^\/logs\s+(\d+)/, (m, mt) => guard(m, () => cmdLogs(m, +mt[1])));
   bot.onText(/^\/preset(?:\s+(\d+)\s+(\w+))?/, (m, mt) => guard(m, () => cmdPreset(m, mt[1] && +mt[1], mt[2])));
+  bot.onText(/^\/sleep\s+(\d+)\s+(on|off)$/, (m, mt) => guard(m, () => cmdSleep(m, +mt[1], mt[2])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
 
   // Resolve any pending /connect waiter the moment the extension hellos.
@@ -101,6 +103,7 @@ const HELP = [
   '/run <id>, /pause <id>, /stop <id>',
   '/stats <id>, /logs <id>',
   '/preset <id> <safe|medium|highvolume> — swap pacing profile',
+  '/sleep <id> <on|off> — toggle 01:00-08:00 sleep window',
   '/disconnect [id] — forget account row (Chrome session itself stays)',
 ].join('\n');
 
@@ -224,6 +227,10 @@ function cmdRun(msg, id) {
       '⚠ Bridge not connected. Campaign will idle until Chrome extension attaches.\n' +
       'Use /connect to wait for it, or just start Chrome — the campaign will pick up automatically.');
   }
+  // Clear any soft-ban backoff state from prior 404 storm. The user's
+  // explicit /run is a signal to retry immediately; if the ban is real
+  // x.com will 404 again and we'll re-arm.
+  clearSoftBan(id);
   db.setCampaignStatus(id, 'running');
   bot.sendMessage(msg.chat.id, `▶ campaign #${id} running`);
 }
@@ -321,6 +328,23 @@ function cmdPreset(msg, id, name) {
     `Estimated: ~${daily} replies/day with current sleep window` + warn);
 }
 
+function cmdSleep(msg, id, onoff) {
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(msg.chat.id, 'No such campaign.');
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    return bot.sendMessage(msg.chat.id, `corrupt config_json: ${e.message}`);
+  }
+  cfg.sleep = cfg.sleep || { startHHMM: '01:00', endHHMM: '08:00' };
+  cfg.sleep.enabled = onoff === 'on';
+  db.setCampaignConfig(id, JSON.stringify(cfg));
+  bot.sendMessage(msg.chat.id,
+    `${onoff === 'on' ? '🌙' : '☀️'} campaign #${id} sleep window ${onoff} ` +
+    `(${cfg.sleep.startHHMM}-${cfg.sleep.endHHMM} local).` +
+    (onoff === 'off' ? '\n\nNote: 24/7 replies put noticeably more pressure on the account. ' +
+      'If you see 401/403/429 in /logs, /sleep on again.' : ''));
+}
+
 function cmdLogs(msg, id) {
   const rows = db.recentLogs(id, 30);
   if (!rows.length) return bot.sendMessage(msg.chat.id, '(empty)');
@@ -344,9 +368,7 @@ function stepNewCampaign(msg, conv) {
   if (conv.step === 'name') {
     conv.draft.name = text;
     conv.step = 'keywords';
-    return bot.sendMessage(msg.chat.id,
-      'Keywords, one per line (X search syntax supported, e.g. ' +
-      '"solana min_faves:5 lang:en -filter:replies"). Send all in one message.');
+    return bot.sendMessage(msg.chat.id, stepKeywordsHelp());
   }
   if (conv.step === 'keywords') {
     cfg.keywords = text.split('\n').map((s) => s.trim()).filter(Boolean);

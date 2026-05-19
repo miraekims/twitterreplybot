@@ -7,7 +7,7 @@
 //      production traffic through here. Routed through the same
 //      handlers map as channel 1.
 import { recordObservation, getAllOps, getHeaders } from './query-registry.js';
-import { tweetDetail, createTweet, searchTimeline } from './x-api.js';
+import { tweetDetail, createTweet, searchTimeline, homeTimeline } from './x-api.js';
 import {
   getConfig, setConfig, getState, getLogs, clearLogs,
   start as autoStart, stop as autoStop, resetSent,
@@ -60,6 +60,7 @@ const handlers = {
   'x.tweetDetail': (p) => tweetDetail(p),
   'x.createTweet': (p) => createTweet(p),
   'x.searchTimeline': (p) => searchTimeline(p),
+  'x.homeTimeline': (p) => homeTimeline(p),
 
   // ----- bot bridge maintenance -----
   // The bot may issue 'ping' as a no-arg liveness check.
