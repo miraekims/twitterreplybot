@@ -254,6 +254,9 @@ export async function homeTimeline({ cursor = null, count = 40 } = {}) {
 
   const baseVars = cleanInheritedVars(safeJsonParse(op.variables));
   const variables = { ...baseVars, count };
+  // X requires these fields; omitting them yields 422 GRAPHQL_VALIDATION_FAILED.
+  if (variables.includePromotedContent == null) variables.includePromotedContent = true;
+  if (variables.latestControlAvailable == null) variables.latestControlAvailable = true;
   if (cursor) variables.cursor = cursor;
 
   const data = await gqlGetExplicit(op, opName, variables);
