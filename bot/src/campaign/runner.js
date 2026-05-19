@@ -218,14 +218,20 @@ export async function tickCampaign(campaign) {
     if (queue.length === 0) return;
   }
 
-  // Pop one and reply. Skip on the fly if the tweet was sent already, or
-  // if the author is currently on per-author cooldown — multiple tweets
-  // from the same author may sit in the queue together (one feed page
-  // can contain a thread or rapid successive posts), and the cooldown
-  // check at scan time only excludes authors we'd already replied to
-  // BEFORE that scan ran.
+  // Pop one and reply. Skip on the fly if:
+  //   - the tweet was sent already (race with a parallel campaign or a
+  //     prior tick that didn't finish),
+  //   - the author is currently on per-author cooldown (multiple tweets
+  //     from the same author may sit in the queue together — one feed
+  //     page can contain a thread or rapid successive posts),
+  //   - or no template matches the tweet's topic AND no catch-all
+  //     template was defined. We deliberately drop rather than send an
+  //     off-topic reply: a "gm fren" reply to a chart-analysis tweet is
+  //     worse than not replying. Users get topic-aware responses by
+  //     defining `tags | text` style templates.
   const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
   let t;
+  let tpl;
   while ((t = queue.shift())) {
     queues.set(campaign.id, queue);
     if (db.isSent(campaign.id, t.id)) continue;
@@ -233,20 +239,28 @@ export async function tickCampaign(campaign) {
       const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
       if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
     }
+    tpl = pickTemplate(cfg.templates, t);
+    if (!tpl) {
+      const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown>';
+      logger.info(
+        'runner',
+        `c${campaign.id} skip ${t.id} (${who}) — no template matched topic`,
+        campaign.id,
+      );
+      continue;
+    }
     break;
   }
-  if (!t) return;
-
-  const tpl = pickTemplate(cfg.templates);
+  if (!t || !tpl) return;
   let text;
   try {
     text = await rewriteTemplate({
-      template: tpl,
+      template: tpl.text,
       tweet: t,
       persona: cfg.persona,
     });
   } catch (e) {
-    text = literalSubstitute(tpl, t);
+    text = literalSubstitute(tpl.text, t);
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
 
@@ -431,8 +445,71 @@ function passesFilters(t, f) {
   return true;
 }
 
-function pickTemplate(templates) {
-  return templates[Math.floor(Math.random() * templates.length)];
+// Topic-aware template selection.
+//
+// Templates can be either:
+//   • plain string  (legacy, catch-all — matches any tweet)
+//   • { match: string[], text: string }  (canonical)
+//
+// The shorthand input format the user types in /new is `tags | text`,
+// parsed by the Telegram layer into the canonical object form.
+//
+// Selection rules:
+//   1. Normalize all entries; drop malformed ones.
+//   2. Split into "matched" (at least one tag substring is present in the
+//      tweet text, all tokens of a multi-word tag must be present in any
+//      order — same semantics as cfg.keywords) and "catchall" (no tags).
+//   3. Prefer matched over catchall. Pick uniformly within the chosen pool.
+//   4. If both pools are empty → return null. The runner treats null as
+//      "skip this tweet" rather than reply off-topic.
+//
+// Why "skip" beats "reply off-topic" — a "gm fren" reply to a chart-analysis
+// post is worse than not replying. The whole point of topic tags is to keep
+// every reply on-topic; randomly picking a catch-all when none was defined
+// would defeat that.
+function pickTemplate(templates, tweet) {
+  if (!Array.isArray(templates) || templates.length === 0) return null;
+  const norm = templates.map(toCanonicalTemplate).filter(Boolean);
+  if (!norm.length) return null;
+  const lower = (tweet?.text || '').toLowerCase();
+
+  const matched = [];
+  const catchall = [];
+  for (const t of norm) {
+    if (!t.match || t.match.length === 0) {
+      catchall.push(t);
+      continue;
+    }
+    if (t.match.some((tag) => allTokensPresent(tag, lower))) matched.push(t);
+  }
+  const pool = matched.length ? matched : catchall;
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function toCanonicalTemplate(entry) {
+  if (typeof entry === 'string') {
+    const text = entry.trim();
+    return text ? { match: [], text } : null;
+  }
+  if (entry && typeof entry === 'object' && typeof entry.text === 'string' && entry.text.trim()) {
+    return {
+      match: Array.isArray(entry.match)
+        ? entry.match.map((s) => String(s).toLowerCase().trim()).filter(Boolean)
+        : [],
+      text: entry.text.trim(),
+    };
+  }
+  return null;
+}
+
+// Same semantics as runner's matchKeyword: a multi-word tag matches if all
+// of its whitespace-split tokens appear in the haystack (case-insensitive,
+// any order). Single-word tags reduce to a plain substring check.
+function allTokensPresent(tag, lowerHaystack) {
+  const tokens = String(tag).toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  return tokens.every((tok) => lowerHaystack.includes(tok));
 }
 
 // Log-normal jitter: most pauses short, occasional long ones (human-shaped).

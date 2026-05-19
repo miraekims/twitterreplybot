@@ -487,11 +487,31 @@ function stepNewCampaign(msg, conv) {
     cfg.keywords = text.split('\n').map((s) => s.trim()).filter(Boolean);
     conv.step = 'templates';
     return bot.sendMessage(msg.chat.id,
-      'Reply templates, one per line. Supports {author}, {name}. ' +
-      'If OPENAI_API_KEY is set, these are used as direction not literal text.');
+      'Reply templates, one per line.\n\n' +
+      'Format: "tags | text" for topic-matched, or just "text" for catch-all.\n\n' +
+      'Examples:\n' +
+      '  gm, good morning, gn | gm fren\n' +
+      '  chart, ta, technical | nice setup, what\'s your stop?\n' +
+      '  bought, longed, bullish | based, what\'s your target?\n' +
+      '  big news for the space\n' +
+      '\n' +
+      'How matching works:\n' +
+      '• Tags = comma-separated, case-insensitive substrings checked against tweet text.\n' +
+      '• Multi-word tag matches if all its words appear (any order).\n' +
+      '• Tweet → picks one matching template at random; falls back to catch-all.\n' +
+      '• If no tags match AND no catch-all → tweet is SKIPPED (not replied to).\n' +
+      '  This keeps replies on-topic instead of "gm" on a chart post.\n' +
+      '\n' +
+      'With OPENAI_API_KEY set, the chosen template is direction (not literal). ' +
+      'AI rewrites in your persona\'s voice referring to the actual tweet.');
   }
   if (conv.step === 'templates') {
-    cfg.templates = text.split('\n').map((s) => s.trim()).filter(Boolean);
+    cfg.templates = parseTemplates(text);
+    if (!cfg.templates.length) {
+      return bot.sendMessage(msg.chat.id,
+        'No valid templates parsed. Each line must have either ' +
+        '"text" (catch-all) or "tags | text". Try again.');
+    }
     conv.step = 'persona';
     return bot.sendMessage(msg.chat.id,
       'Persona (one line, "name | bio | style") or "skip" to use plain templates.\n' +
@@ -679,4 +699,44 @@ async function handleCallback(q) {
   } catch (e) {
     await bot.answerCallbackQuery(q.id, { text: `Error: ${e.message}`.slice(0, 200), show_alert: true });
   }
+}
+
+
+
+// ---------- template parsing ----------
+//
+// Input from the /new walkthrough is multiline, one entry per line. Each
+// line is either:
+//   • `tags, more, tags | reply text`  (topic-matched)
+//   • `reply text`                     (catch-all)
+//
+// Tags are comma-separated, lower-cased, trimmed. Empty tags + presence of
+// "|" is malformed and dropped. The runner's pickTemplate() accepts both
+// canonical objects and legacy plain strings; we always emit canonical
+// objects from this parser to keep things uniform going forward.
+function parseTemplates(blob) {
+  const lines = String(blob || '').split('\n');
+  const out = [];
+  for (const raw of lines) {
+    const parsed = parseTemplateLine(raw);
+    if (parsed) out.push(parsed);
+  }
+  return out;
+}
+
+function parseTemplateLine(line) {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) return null;
+  const idx = trimmed.indexOf('|');
+  if (idx === -1) {
+    // No pipe ⇒ catch-all template, the whole line is the text.
+    return { match: [], text: trimmed };
+  }
+  const tagsStr = trimmed.slice(0, idx).trim();
+  const text = trimmed.slice(idx + 1).trim();
+  if (!text) return null; // "tags |" with no body is meaningless
+  const match = tagsStr
+    ? tagsStr.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+    : [];
+  return { match, text };
 }
