@@ -20,6 +20,11 @@
 //    Caveat: this counts toward X's "active tab" heuristics for the
 //    account, which is fine — it makes the account *look* more active,
 //    which is what we want anyway.
+//
+//    `warmupXcom` is also exported for one-shot use from bridge-client.js
+//    on connect, so a fresh bot session immediately gets HomeTimeline /
+//    UserByScreenName / etc. captured even if the user hasn't manually
+//    visited x.com since opening Chrome.
 
 import { ensureConnected } from './bridge-client.js';
 
@@ -29,6 +34,11 @@ const ALARM_TOUCH = 'xbot.xTouch';
 const BRIDGE_WATCHDOG_PERIOD_MIN = 1;     // every minute
 const X_TOUCH_PERIOD_MIN = 6 * 60;         // every 6 hours
 const TOUCH_TAB_TTL_MS = 8_000;            // close the touch tab after 8s
+
+// Avoid flapping warmups on bridge reconnect storms (e.g. Wi-Fi drops). At
+// most one warmup every 5 minutes regardless of how many callers ask.
+const WARMUP_DEBOUNCE_MS = 5 * 60_000;
+let lastWarmupAt = 0;
 
 export function registerKeepalive() {
   // Idempotent — alarms persist across SW restarts so we don't double-create.
@@ -47,19 +57,39 @@ export function registerKeepalive() {
       return;
     }
     if (alarm.name === ALARM_TOUCH) {
-      touchXcom().catch((e) => console.warn('[xbot keepalive] touch failed:', e.message));
+      warmupXcom('alarm').catch((e) => console.warn('[xbot keepalive] touch failed:', e.message));
       return;
     }
   });
 }
 
-async function touchXcom() {
+// Open a hidden x.com/home tab so the page fires its initial GraphQL
+// requests (HomeTimeline, UserByScreenName, ...). The query-registry
+// captures them and our SearchTimeline / CreateTweet calls then have
+// fresh queryId + headers to work with.
+//
+// Skips if:
+//   - User already has an x.com tab open (it's actively warming itself).
+//   - We warmed up within WARMUP_DEBOUNCE_MS (avoids flapping on reconnect).
+//
+// Returns true if a warmup tab was actually opened, false if skipped.
+export async function warmupXcom(reason = 'manual') {
   // Skip if user already has an x.com tab open — the page is naturally
   // refreshing observations as they browse. No need to add a hidden tab.
   const existing = await chrome.tabs.query({ url: ['*://x.com/*', '*://twitter.com/*'] });
-  if (existing.length > 0) return;
+  if (existing.length > 0) {
+    console.log(`[xbot keepalive] warmup (${reason}) skipped — x.com tab already open`);
+    return false;
+  }
 
-  console.log('[xbot keepalive] no x.com tab open — touching one in background');
+  const sinceLast = Date.now() - lastWarmupAt;
+  if (lastWarmupAt && sinceLast < WARMUP_DEBOUNCE_MS) {
+    console.log(`[xbot keepalive] warmup (${reason}) skipped — last warmup was ${Math.round(sinceLast/1000)}s ago`);
+    return false;
+  }
+
+  console.log(`[xbot keepalive] warmup (${reason}) — opening hidden x.com tab`);
+  lastWarmupAt = Date.now();
   const tab = await chrome.tabs.create({ url: 'https://x.com/home', active: false });
   // Give the page enough time to fire its initial GraphQL warm-up. 8s is a
   // pragmatic compromise: enough for HomeTimeline + UserByScreenName, short
@@ -67,4 +97,5 @@ async function touchXcom() {
   setTimeout(() => {
     chrome.tabs.remove(tab.id).catch(() => {});
   }, TOUCH_TAB_TTL_MS);
+  return true;
 }

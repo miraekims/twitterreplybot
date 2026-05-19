@@ -45,6 +45,8 @@ export const PRESETS = {
     searchEverySec: 180,
     maxRepliesPerHour: 10,
     diversityCooldownSec: 1800,
+    authorCooldownHours: 24,
+    cursorRefreshMin: 30,
   },
   medium: {
     minDelaySec: 25,
@@ -52,6 +54,8 @@ export const PRESETS = {
     searchEverySec: 150,
     maxRepliesPerHour: 30,
     diversityCooldownSec: 1200,
+    authorCooldownHours: 24,
+    cursorRefreshMin: 30,
   },
   // 1000 replies/day target. Math: with sleep 01-08 we have 17 active hours
   // and a hard hourly cap of 75 ⇒ 1275 ceiling, leaving headroom for:
@@ -72,6 +76,11 @@ export const PRESETS = {
     searchEverySec: 90,
     maxRepliesPerHour: 75,
     diversityCooldownSec: 600,
+    authorCooldownHours: 24,
+    // Tighter on highvolume: we're churning through search results faster,
+    // so refresh-to-top more often to avoid replying to stale 30-min-old
+    // tweets when fresh ones are arriving every minute.
+    cursorRefreshMin: 15,
   },
 };
 

@@ -25,6 +25,7 @@
 
 import { storage } from '../core/storage.js';
 import { getAllOps, getHeaders } from './query-registry.js';
+import { warmupXcom } from './keepalive.js';
 
 const SETTINGS_KEY = 'bridge.settings';
 const STATUS_KEY = 'bridge.status';
@@ -169,6 +170,17 @@ async function connect() {
     // chrome.storage onChange fires on each recordObservation.
     if (opSummaryUnsub) opSummaryUnsub();
     opSummaryUnsub = subscribeToOpUpdates();
+
+    // Auto-warmup: if we just connected to the bot but the user doesn't
+    // currently have an x.com tab open, open one in the background so the
+    // page-hook captures HomeTimeline / UserByScreenName / etc. Without
+    // this, a fresh Chrome session can leave us with stale or missing op
+    // captures and the bot's first SearchTimeline call 404s. The warmup
+    // function debounces internally (won't refire within 5min) so this is
+    // safe even on reconnect storms.
+    warmupXcom('bridge.connect').catch((e) => {
+      console.warn('[xbot bridge] warmup failed:', e && e.message);
+    });
   });
 
   ws.addEventListener('message', async (ev) => {

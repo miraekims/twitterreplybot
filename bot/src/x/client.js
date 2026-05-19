@@ -31,8 +31,8 @@ export class XClient {
     this.lang = lang;
   }
 
-  async searchTimeline({ query }) {
-    return rpc('x.searchTimeline', { query });
+  async searchTimeline({ query, cursor } = {}) {
+    return rpc('x.searchTimeline', { query, cursor });
   }
 
   async createTweet({ text, replyToTweetId }) {

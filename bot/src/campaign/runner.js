@@ -42,6 +42,15 @@ const nextEligibleAt = new Map();      // campaign_id → timestamp ms
 const lastSearchEmpty = new Map();     // campaign_id → boolean (true = throttle)
 const sleepLogTickedAt = new Map();    // campaign_id → timestamp ms (rate-limit sleep msgs)
 const bridgeWarnedAt = new Map();      // campaign_id → ts (last "bridge offline" warn)
+// Cursor pagination state — see runSearchPhase. We persist the bottom
+// cursor returned by SearchTimeline per (campaign, keyword) so successive
+// phases dig deeper into older results, avoiding the failure mode where
+// every search returns the same already-replied top tweets and the queue
+// stays empty forever. cursorResetAt tracks when we last cleared cursors;
+// when cfg.pacing.cursorRefreshMin elapses, we drop everything and start
+// from the top again so fresh tweets aren't missed.
+const searchCursors = new Map();       // campaign_id → Map<keyword, cursor>
+const cursorResetAt = new Map();       // campaign_id → ts of last cursor reset
 
 export async function tickCampaign(campaign) {
   const cfg = JSON.parse(campaign.config_json);
@@ -110,10 +119,24 @@ export async function tickCampaign(campaign) {
     if (queue.length === 0) return;
   }
 
-  // Pop one and reply.
-  const t = queue.shift();
-  queues.set(campaign.id, queue);
-  if (db.isSent(campaign.id, t.id)) return;
+  // Pop one and reply. Skip on the fly if the tweet was sent already (race
+  // between search and reply on a parallel campaign), or if the author is
+  // currently on per-author cooldown — multiple tweets from the same
+  // author may sit in the queue together, and the cooldown check at search
+  // time only excludes authors we'd already replied to BEFORE the search
+  // ran.
+  const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
+  let t;
+  while ((t = queue.shift())) {
+    queues.set(campaign.id, queue);
+    if (db.isSent(campaign.id, t.id)) continue;
+    if (cooldownMsAuthor > 0 && t.authorHandle) {
+      const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
+      if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
+    }
+    break;
+  }
+  if (!t) return;
 
   const tpl = pickTemplate(cfg.templates);
   let text;
@@ -136,6 +159,7 @@ export async function tickCampaign(campaign) {
   try {
     await client.createTweet({ text, replyToTweetId: t.id });
     db.markSent(campaign.id, t.id);
+    if (t.authorHandle) db.markAuthorReplied(campaign.id, t.authorHandle);
     db.bumpCampaignAction(campaign.id, 'reply');
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})`, campaign.id);
@@ -157,13 +181,43 @@ export async function tickCampaign(campaign) {
 }
 
 async function runSearchPhase(client, campaign, cfg) {
+  // Auto-refresh cursors. Every cursorRefreshMin minutes we drop all
+  // saved cursors so the next call to SearchTimeline starts at the top of
+  // the timeline again. Without this, after enough pagination we'd be
+  // permanently stuck reading old tweets and never see fresh ones. With
+  // it, we cycle: top → deeper → deeper → ... → reset → top → ...
+  const refreshMin = cfg.pacing.cursorRefreshMin ?? 30;
+  const lastReset = cursorResetAt.get(campaign.id) || 0;
+  if (refreshMin > 0 && Date.now() - lastReset > refreshMin * 60_000) {
+    const prev = searchCursors.get(campaign.id);
+    if (prev && prev.size > 0) {
+      logger.info('runner', `c${campaign.id} cursor reset (every ${refreshMin}min) — fetching fresh top`, campaign.id);
+    }
+    searchCursors.set(campaign.id, new Map());
+    cursorResetAt.set(campaign.id, Date.now());
+  }
+  let cursors = searchCursors.get(campaign.id);
+  if (!cursors) { cursors = new Map(); searchCursors.set(campaign.id, cursors); }
+
   const all = [];
   const seen = new Set();
   for (const kw of cfg.keywords) {
     try {
-      const { tweets } = await client.searchTimeline({ query: kw });
+      const cursor = cursors.get(kw) || null;
+      const res = await client.searchTimeline({ query: kw, cursor });
+      const tweets = res.tweets || [];
+      const nextCursor = res.nextCursor || null;
       for (const t of tweets) {
         if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _kw: kw }); }
+      }
+      // If X returned no tweets or no continuation cursor, we hit the
+      // bottom of paginatable results. Drop our saved cursor for this
+      // keyword so the NEXT search phase starts over from the top instead
+      // of repeatedly hitting the same exhausted page.
+      if (!tweets.length || !nextCursor) {
+        cursors.delete(kw);
+      } else {
+        cursors.set(kw, nextCursor);
       }
     } catch (e) {
       // Hard errors (bridge down, auth, rate limit) bubble up so the
@@ -171,6 +225,9 @@ async function runSearchPhase(client, campaign, cfg) {
       if (e.code === 'BRIDGE_DISCONNECTED') throw e;
       if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
       logger.warn('runner', `c${campaign.id} search "${kw}": ${e.message}`, campaign.id);
+      // Soft error — drop cursor too so we don't get stuck retrying with
+      // a bad cursor. Next phase tries fresh top.
+      cursors.delete(kw);
     }
     await sleep(800 + Math.random() * 800);
   }
@@ -179,12 +236,21 @@ async function runSearchPhase(client, campaign, cfg) {
   // tweets is dropped solely for missing authorHandle, that's our canary
   // for X having silently changed the user-result shape again.
   let droppedNoHandle = 0;
+  let droppedAuthorCooldown = 0;
+  const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
   const passed = [];
   for (const t of all) {
     if (!t || !t.id || !t.text) continue;
     if (!t.authorHandle) { droppedNoHandle++; continue; }
     if (!passesFilters(t, cfg.filters)) continue;
     if (db.isSent(campaign.id, t.id)) continue;
+    if (cooldownMsAuthor > 0) {
+      const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
+      if (lastTs && Date.now() - lastTs < cooldownMsAuthor) {
+        droppedAuthorCooldown++;
+        continue;
+      }
+    }
     passed.push(t);
   }
   if (droppedNoHandle > 0 && all.length > 0) {
@@ -193,6 +259,13 @@ async function runSearchPhase(client, campaign, cfg) {
     logger[fn](
       'runner',
       `c${campaign.id} dropped ${droppedNoHandle}/${all.length} tweets with no handle (${pct}%)`,
+      campaign.id,
+    );
+  }
+  if (droppedAuthorCooldown > 0) {
+    logger.info(
+      'runner',
+      `c${campaign.id} dropped ${droppedAuthorCooldown} tweets on per-author cooldown`,
       campaign.id,
     );
   }

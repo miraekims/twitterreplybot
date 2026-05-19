@@ -202,12 +202,23 @@ export async function tweetDetail({ tweetId }) {
 // observed with — overriding `querySource` ("typed_query" vs "recent_search_click")
 // or `product` ("Latest" vs "Top") yields HTTP 404 even with a perfect URL,
 // because the persistent query expects a specific input.
-export async function searchTimeline({ query }) {
+//
+// Pagination: caller may pass `cursor` to continue from a previous page.
+// We don't inherit cursors from captured variables (see VARS_BLACKLIST) —
+// that captured cursor is from the user's own browsing and irrelevant to
+// the bot's pagination state. We do return a `nextCursor` extracted from
+// the response so the caller can drive its own pagination.
+export async function searchTimeline({ query, cursor }) {
   const op = await ensureOp('SearchTimeline');
   const baseVars = cleanInheritedVars(safeJsonParse(op.variables));
   const variables = { ...baseVars, rawQuery: query };
+  if (cursor) variables.cursor = cursor;
   const data = await gqlGet('SearchTimeline', variables);
-  return { tweets: extractTweets(data), raw: data };
+  return {
+    tweets: extractTweets(data),
+    nextCursor: extractBottomCursor(data),
+    raw: data,
+  };
 }
 
 // ---- CreateTweet (post a reply or a top-level tweet) ----
@@ -328,4 +339,23 @@ function extractTweets(data) {
     for (const k of Object.keys(node)) stack.push(node[k]);
   }
   return out;
+}
+
+// Find the "bottom" cursor in a SearchTimeline response — the value the
+// caller passes back as `cursor` to fetch the next (older) page. X
+// embeds these as TimelineTimelineCursor nodes with `cursorType: "Bottom"`
+// inside the timeline.instructions[].entries[]. Walking the tree is more
+// robust than encoding the exact path because X has changed it before.
+function extractBottomCursor(data) {
+  const stack = [data];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    if (Array.isArray(node)) { for (const c of node) stack.push(c); continue; }
+    if (node.cursorType === 'Bottom' && typeof node.value === 'string' && node.value) {
+      return node.value;
+    }
+    for (const k of Object.keys(node)) stack.push(node[k]);
+  }
+  return null;
 }
