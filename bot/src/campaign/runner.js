@@ -46,6 +46,7 @@ import { logger } from '../core/logger.js';
 import { XClient } from '../x/client.js';
 import { bridge } from '../bridge/server.js';
 import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
+import { notifyOwnersDebounced, resetDebounce } from '../core/notify.js';
 
 // Per-campaign in-memory state. Rebuilt fresh on process restart — the only
 // thing we lose is "next eligible at", which means a freshly-restarted bot
@@ -95,6 +96,46 @@ function clearBan(campaignId) {
 
 export function clearSoftBan(campaignId) {
   clearBan(campaignId);
+}
+
+// Detect "Operation X not captured yet" errors propagated from the Chrome
+// extension via the bridge, and push a one-shot Telegram nag explaining
+// the one-time manual fix. Debounced so a stuck campaign hammering the
+// same op doesn't carpet-bomb the chat.
+//
+// Why this matters: the extension learns each X.com GraphQL op shape only
+// by observing the *real x.com tab* issuing it. HomeTimeline auto-warmup
+// covers itself (we open x.com/home in a hidden tab on bridge connect).
+// CreateTweet, however, is a write op — it only fires when a human actually
+// posts something. There's no way for us to capture it without the user
+// doing one manual tweet. Better to surface that clearly than to keep
+// throwing into a logger the user might not be tailing.
+function maybeNotifyMissingOp(campaignId, errMessage) {
+  const m = /Operation (\w+) not captured yet/.exec(errMessage || '');
+  if (!m) return;
+  const opName = m[1];
+  const key = `op-missing:${opName}`;
+  const isWriteOp = opName === 'CreateTweet';
+  const text = isWriteOp
+    ? `⚠️ Я не могу отвечать пока расширение не поймает шаблон CreateTweet.\n\n` +
+      `One-time fix: открой x.com → запости что-нибудь (любой ответ, хоть «gm») → готово.\n` +
+      `После этого я подхвачу шаблон автоматически и продолжу через ~5 секунд. ` +
+      `Делается раз в несколько недель — обычно X не меняет queryId чаще.`
+    : `⚠️ Расширение не поймало шаблон ${opName} (campaign #${campaignId}).\n\n` +
+      `Открой x.com и подёргай ленту — page-hook поймает op автоматически.`;
+  // 4 hour debounce: if the user does the manual tweet within minutes, we
+  // re-arm via resetDebounce in the success path. If they ignore the nag,
+  // we re-nag every 4h instead of every 5s.
+  notifyOwnersDebounced(key, 4 * 3600_000, text).catch(() => {});
+}
+
+// Mirrors maybeNotifyMissingOp: when a reply finally succeeds we know the
+// op was captured fine, so a *future* missing-op event should re-arm
+// immediately (instead of waiting out a stale 4h debounce). We only need
+// this for write ops we already nagged about.
+function clearMissingOpDebounce() {
+  resetDebounce('op-missing:CreateTweet');
+  resetDebounce('op-missing:HomeTimeline');
 }
 
 export async function tickCampaign(campaign) {
@@ -167,6 +208,7 @@ export async function tickCampaign(campaign) {
       }
     } catch (e) {
       logger.error('runner', `c${campaign.id} feed scan: ${e.message}`, campaign.id);
+      maybeNotifyMissingOp(campaign.id, e.message);
       if (e.code === 'BRIDGE_DISCONNECTED') return;
       if (e.status === 401 || e.status === 403 || e.status === 429) {
         db.setCampaignStatus(campaign.id, 'error', e.message);
@@ -216,12 +258,17 @@ export async function tickCampaign(campaign) {
     db.markSent(campaign.id, t.id);
     if (t.authorHandle) db.markAuthorReplied(campaign.id, t.authorHandle);
     db.bumpCampaignAction(campaign.id, 'reply');
+    // Successful reply ⇒ CreateTweet op was captured and works. Clear any
+    // outstanding "missing op" debounce so a future regression re-nags
+    // immediately instead of waiting 4h.
+    clearMissingOpDebounce();
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     const kw = t._matchedKeyword ? ` [kw="${t._matchedKeyword}"]` : '';
     logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})${kw}`, campaign.id);
   } catch (e) {
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     logger.error('runner', `c${campaign.id} reply ${t.id} (${who}): ${e.message}`, campaign.id);
+    maybeNotifyMissingOp(campaign.id, e.message);
     if (e.code === 'BRIDGE_DISCONNECTED') {
       queue.unshift(t);
       queues.set(campaign.id, queue);
