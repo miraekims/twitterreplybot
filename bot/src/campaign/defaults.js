@@ -54,6 +54,13 @@ export const PRESETS = {
     searchEverySec: 180,
     maxRepliesPerHour: 10,
     diversityCooldownSec: 1800,
+    // Per-author cooldown — never reply to the same @handle more often
+    // than every N hours, regardless of how many of their tweets match.
+    authorCooldownHours: 24,
+    // Force-reset HomeTimeline scroll cursor every N minutes so a busy
+    // feed (which would otherwise never produce two consecutive empty
+    // pages) still cycles back to the top to pick up fresh tweets.
+    cursorRefreshMin: 30,
   },
   medium: {
     minDelaySec: 25,
@@ -61,6 +68,8 @@ export const PRESETS = {
     searchEverySec: 150,
     maxRepliesPerHour: 30,
     diversityCooldownSec: 1200,
+    authorCooldownHours: 24,
+    cursorRefreshMin: 30,
   },
   // 1000 replies/day target. With sleep OFF (default now) we have all 24
   // active hours and a hard hourly cap of 50 ⇒ 1200/day ceiling. With
@@ -77,6 +86,10 @@ export const PRESETS = {
     searchEverySec: 60,
     maxRepliesPerHour: 50,
     diversityCooldownSec: 600,
+    authorCooldownHours: 24,
+    // Tighter on highvolume: feed is consumed faster, refresh-to-top
+    // more often so we don't reply to stale tweets older than 15min.
+    cursorRefreshMin: 15,
   },
 };
 

@@ -59,9 +59,14 @@ const bridgeWarnedAt = new Map();      // campaign_id → ts (last "bridge offli
 // HomeTimeline cursor for incremental scroll. When nextCursor returns null
 // (end of available feed) or a scan returns 0 fresh tweets twice in a row,
 // we reset to null and start from the top — same behavior as the X UI's
-// pull-to-refresh.
+// pull-to-refresh. We ALSO force a reset every cfg.pacing.cursorRefreshMin
+// minutes regardless of feed state, so a constantly-active feed (which
+// would never produce two empty pages in a row) still cycles back to the
+// top periodically — otherwise we'd permanently scroll into history and
+// never see fresh tweets at the top.
 const scrollCursor = new Map();        // campaign_id → opaque cursor string
 const emptyScrollStreak = new Map();   // campaign_id → count
+const cursorResetAt = new Map();       // campaign_id → ts of last forced reset
 
 // Soft-ban detector. Mostly a safety net now that we use HomeTimeline,
 // which is the most-used endpoint on x.com — getting 404s from it would
@@ -171,10 +176,24 @@ export async function tickCampaign(campaign) {
     if (queue.length === 0) return;
   }
 
-  // Pop one and reply.
-  const t = queue.shift();
-  queues.set(campaign.id, queue);
-  if (db.isSent(campaign.id, t.id)) return;
+  // Pop one and reply. Skip on the fly if the tweet was sent already, or
+  // if the author is currently on per-author cooldown — multiple tweets
+  // from the same author may sit in the queue together (one feed page
+  // can contain a thread or rapid successive posts), and the cooldown
+  // check at scan time only excludes authors we'd already replied to
+  // BEFORE that scan ran.
+  const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
+  let t;
+  while ((t = queue.shift())) {
+    queues.set(campaign.id, queue);
+    if (db.isSent(campaign.id, t.id)) continue;
+    if (cooldownMsAuthor > 0 && t.authorHandle) {
+      const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
+      if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
+    }
+    break;
+  }
+  if (!t) return;
 
   const tpl = pickTemplate(cfg.templates);
   let text;
@@ -195,6 +214,7 @@ export async function tickCampaign(campaign) {
   try {
     await client.createTweet({ text, replyToTweetId: t.id });
     db.markSent(campaign.id, t.id);
+    if (t.authorHandle) db.markAuthorReplied(campaign.id, t.authorHandle);
     db.bumpCampaignAction(campaign.id, 'reply');
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     const kw = t._matchedKeyword ? ` [kw="${t._matchedKeyword}"]` : '';
@@ -217,6 +237,29 @@ export async function tickCampaign(campaign) {
 // Pull one HomeTimeline page (advancing the per-campaign cursor), filter
 // locally by cfg.keywords + cfg.filters. Returns the matched tweets.
 async function runFeedScan(client, campaign, cfg) {
+  // Time-based cursor refresh. The existing 2-empty-pages logic only fires
+  // when the feed runs out of fresh tweets to show — but on an active
+  // feed we may never see two empty pages in a row, in which case the
+  // cursor would crawl ever deeper into history and we'd stop seeing
+  // recent tweets. Force a reset every cursorRefreshMin minutes so we
+  // cycle: top → deeper → ... → reset → top. Mimics how a real user
+  // periodically hits the "show new tweets" banner at the top of the
+  // feed.
+  const refreshMin = cfg.pacing.cursorRefreshMin ?? 30;
+  const lastForced = cursorResetAt.get(campaign.id) || 0;
+  if (refreshMin > 0 && Date.now() - lastForced > refreshMin * 60_000) {
+    if (scrollCursor.has(campaign.id)) {
+      logger.info(
+        'runner',
+        `c${campaign.id} cursor refresh (every ${refreshMin}min) — fetching fresh top of feed`,
+        campaign.id,
+      );
+    }
+    scrollCursor.delete(campaign.id);
+    emptyScrollStreak.set(campaign.id, 0);
+    cursorResetAt.set(campaign.id, Date.now());
+  }
+
   const cursor = scrollCursor.get(campaign.id) || null;
   let resp;
   try {
@@ -263,8 +306,10 @@ async function runFeedScan(client, campaign, cfg) {
   // words appear (in any order) — this lets you say "gm crypto" without
   // it requiring those exact tokens adjacent.
   const keywords = (cfg.keywords || []).map((k) => k.trim()).filter(Boolean);
+  const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
   let droppedNoHandle = 0;
   let droppedNoMatch = 0;
+  let droppedAuthorCooldown = 0;
   const passed = [];
   for (const t of resp.tweets || []) {
     if (!t || !t.id || !t.text) continue;
@@ -273,14 +318,22 @@ async function runFeedScan(client, campaign, cfg) {
     if (!matched) { droppedNoMatch++; continue; }
     if (!passesFilters(t, cfg.filters)) continue;
     if (db.isSent(campaign.id, t.id)) continue;
+    if (cooldownMsAuthor > 0) {
+      const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
+      if (lastTs && Date.now() - lastTs < cooldownMsAuthor) {
+        droppedAuthorCooldown++;
+        continue;
+      }
+    }
     t._matchedKeyword = matched;
     passed.push(t);
   }
   if ((resp.tweets || []).length > 0) {
+    const cooldownPart = droppedAuthorCooldown > 0 ? `, ${droppedAuthorCooldown} author-cooldown` : '';
     logger.info(
       'runner',
       `c${campaign.id} feed page: ${resp.tweets.length} tweets, ${passed.length} kw-matched, ` +
-      `${droppedNoMatch} no-match, ${droppedNoHandle} no-handle`,
+      `${droppedNoMatch} no-match, ${droppedNoHandle} no-handle${cooldownPart}`,
       campaign.id,
     );
   }
