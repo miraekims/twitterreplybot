@@ -26,28 +26,41 @@ import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS, ste
 import { aiActivationSummary } from '../persona/persona.js';
 import { bridge } from '../bridge/server.js';
 import { clearSoftBan } from '../campaign/runner.js';
+import { setNotifier } from '../core/notify.js';
 
 let bot;
 const conversations = new Map(); // chatId → { kind, step, draft }
 // Pending /connect waiters: chatId → { tgUserId, timeoutHandle }
 const connectWaiters = new Map();
 
-function allowed(userId) {
-  const list = (process.env.TELEGRAM_ALLOWED_USERS || '')
+// Default TTL for "help-class" replies (e.g. /help, /accounts, /diagnose,
+// /campaigns) that are throwaway by nature — both the user's command and
+// our reply auto-delete after this many ms so the chat stays clean. Action
+// confirmations and error messages skip this on purpose; you don't want
+// the trail evaporating when something went wrong.
+const EPHEMERAL_TTL_MS = 90_000;
+
+// Allowed-list cache, parsed once. Used for both authz on inbound messages
+// and for broadcasting notifyOwners() pings.
+function allowedUserIds() {
+  return (process.env.TELEGRAM_ALLOWED_USERS || '')
     .split(',').map((s) => s.trim()).filter(Boolean).map(Number);
-  return list.includes(Number(userId));
+}
+
+function allowed(userId) {
+  return allowedUserIds().includes(Number(userId));
 }
 
 export function startTelegram() {
   bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
   bot.on('polling_error', (e) => logger.warn('tg', `polling: ${e.message}`));
 
-  bot.onText(/^\/start$/, (m) => guard(m, () => bot.sendMessage(m.chat.id, HELP)));
-  bot.onText(/^\/help$/, (m) => guard(m, () => bot.sendMessage(m.chat.id, HELP)));
+  bot.onText(/^\/start$/, (m) => guard(m, () => sendEphemeral(m, HELP)));
+  bot.onText(/^\/help$/, (m) => guard(m, () => sendEphemeral(m, HELP)));
   bot.onText(/^\/accounts$/, (m) => guard(m, () => cmdAccounts(m)));
   bot.onText(/^\/connect$/, (m) => guard(m, () => cmdConnect(m)));
   bot.onText(/^\/disconnect(?:\s+(\d+))?/, (m, mt) => guard(m, () => cmdDisconnect(m, mt[1] && +mt[1])));
-  bot.onText(/^\/campaigns$/, (m) => guard(m, () => cmdCampaigns(m)));
+  bot.onText(/^\/(?:campaigns|list)$/, (m) => guard(m, () => cmdCampaigns(m)));
   bot.onText(/^\/new(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdNew(m, mt[1] && +mt[1])));
   bot.onText(/^\/run\s+(\d+)/, (m, mt) => guard(m, () => cmdRun(m, +mt[1])));
   bot.onText(/^\/pause\s+(\d+)/, (m, mt) => guard(m, () => cmdSetStatus(m, +mt[1], 'paused')));
@@ -56,7 +69,36 @@ export function startTelegram() {
   bot.onText(/^\/logs\s+(\d+)/, (m, mt) => guard(m, () => cmdLogs(m, +mt[1])));
   bot.onText(/^\/preset(?:\s+(\d+)\s+(\w+))?/, (m, mt) => guard(m, () => cmdPreset(m, mt[1] && +mt[1], mt[2])));
   bot.onText(/^\/sleep\s+(\d+)\s+(on|off)$/, (m, mt) => guard(m, () => cmdSleep(m, +mt[1], mt[2])));
+  bot.onText(/^\/diag(?:nose)?(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdDiagnose(m, mt[1] && +mt[1])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
+  bot.on('callback_query', (q) => handleCallback(q).catch((e) => {
+    logger.warn('tg', `callback: ${e && e.message}`);
+  }));
+
+  // Register the visible command list with Telegram. After this, typing
+  // "/" in the chat shows a native popup with all commands and one-line
+  // descriptions — discoverability without us having to remember them.
+  // Idempotent and cheap; safe to re-run on every boot.
+  registerCommands().catch((e) => logger.warn('tg', `setMyCommands: ${e.message}`));
+
+  // Wire the cross-module notifier so runner.js (and anything else) can
+  // broadcast operator-visible warnings to Telegram. Single owner ⇒ one
+  // chat; multi-owner ⇒ broadcast to all allowed user IDs (each is its
+  // own private chat with the bot, chatId == userId for direct messages).
+  setNotifier(async (text, opts = {}) => {
+    const ids = allowedUserIds();
+    if (!ids.length) return;
+    const sendOpts = opts.keyboard
+      ? { reply_markup: { inline_keyboard: opts.keyboard } }
+      : {};
+    await Promise.all(ids.map((id) =>
+      bot.sendMessage(id, text, sendOpts).catch((e) => {
+        // sendMessage fails if the user hasn't started a chat with the bot
+        // yet (chat not initialized) or blocked it. Log once, don't crash.
+        logger.warn('tg', `notify ${id}: ${e && e.message}`);
+      }),
+    ));
+  });
 
   // Resolve any pending /connect waiter the moment the extension hellos.
   bridge.onConnect(async (status) => {
@@ -99,13 +141,66 @@ const HELP = [
   '/connect — wait for the Chrome extension to attach',
   '/accounts — list connected X account(s)',
   '/new — create a campaign (keywords + templates + persona)',
-  '/campaigns — list campaigns',
+  '/campaigns (alias /list) — list campaigns with action buttons',
   '/run <id>, /pause <id>, /stop <id>',
-  '/stats <id>, /logs <id>',
+  '/stats <id> — full status with inline action buttons',
+  '/logs <id> — last 30 log lines',
   '/preset <id> <safe|medium|highvolume> — swap pacing profile',
-  '/sleep <id> <on|off> — toggle 01:00-08:00 sleep window',
+  '/sleep <id> <on|off> — toggle sleep window (default 01:00-08:00)',
+  '/diagnose [id] — show bridge + captured-op health and tips',
   '/disconnect [id] — forget account row (Chrome session itself stays)',
+  '',
+  'Tip: type "/" in chat to get a native popup with all commands.',
 ].join('\n');
+
+// One-line descriptions for setMyCommands. Telegram caps these at 256 chars
+// per command; keep them short and action-oriented.
+const COMMAND_LIST = [
+  { command: 'connect', description: 'Attach Chrome extension' },
+  { command: 'accounts', description: 'Show connected X accounts' },
+  { command: 'new', description: 'Create a new campaign' },
+  { command: 'campaigns', description: 'List campaigns + action buttons' },
+  { command: 'list', description: 'Alias for /campaigns' },
+  { command: 'run', description: 'Run a campaign — /run <id>' },
+  { command: 'pause', description: 'Pause a campaign — /pause <id>' },
+  { command: 'stop', description: 'Stop a campaign — /stop <id>' },
+  { command: 'stats', description: 'Campaign stats — /stats <id>' },
+  { command: 'logs', description: 'Recent log lines — /logs <id>' },
+  { command: 'preset', description: 'Swap pacing — /preset <id> <name>' },
+  { command: 'sleep', description: 'Sleep window — /sleep <id> on|off' },
+  { command: 'diagnose', description: 'Bridge + captured-op health' },
+  { command: 'disconnect', description: 'Forget account row — /disconnect [id]' },
+  { command: 'help', description: 'Show full help' },
+];
+
+async function registerCommands() {
+  await bot.setMyCommands(COMMAND_LIST);
+  logger.info('tg', `setMyCommands → ${COMMAND_LIST.length} commands registered`);
+}
+
+// Send a message that auto-deletes itself (and the user's command, if we
+// got the original `msg`) after EPHEMERAL_TTL_MS. Used for help-class
+// replies — /help, /accounts, /diagnose, /campaigns list — that are
+// throwaway and would otherwise clutter the chat.
+//
+// Telegram lets bots delete their own messages and any message in a chat
+// where they have admin rights — for direct chats that's always true. If
+// deleteMessage fails (e.g. message older than 48h), we just swallow the
+// error: the alternative is a dangling timer that errors loudly, which
+// would scare the user more than a stuck message.
+async function sendEphemeral(msg, text, extra = {}, ttlMs = EPHEMERAL_TTL_MS) {
+  const sent = await bot.sendMessage(msg.chat.id, text, extra);
+  if (ttlMs > 0) {
+    setTimeout(() => {
+      bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {});
+      // Also delete the user's command. Best-effort; private chats only.
+      if (msg.message_id) {
+        bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+      }
+    }, ttlMs);
+  }
+  return sent;
+}
 
 // ---------- accounts ----------
 function ensureAccountForHandle(owner_tg, handle) {
@@ -133,7 +228,7 @@ function cmdAccounts(msg) {
   const bridgeLine = status.connected
     ? `Bridge: ✓ connected as @${status.handle} (v${status.extVersion || '?'})`
     : 'Bridge: ✗ not connected — open Chrome with the extension on x.com';
-  bot.sendMessage(msg.chat.id, `${bridgeLine}\n\n${lines.join('\n')}`);
+  return sendEphemeral(msg, `${bridgeLine}\n\n${lines.join('\n')}`);
 }
 
 function cmdConnect(msg) {
@@ -157,7 +252,7 @@ function cmdConnect(msg) {
         ' • Chrome is running on this Mac\n' +
         ' • You are logged into x.com in some tab\n' +
         ' • The X Reply Bot extension is enabled (chrome://extensions)\n' +
-        ' • In the extension options, the bridge URL is `ws://host.docker.internal:8787`\n' +
+        ' • In the extension options, the bridge URL is `ws://127.0.0.1:8787`\n' +
         '   and the token matches XBOT_BRIDGE_TOKEN in bot/.env',
       );
     }
@@ -191,10 +286,25 @@ function cmdDisconnect(msg, id) {
 // ---------- campaigns ----------
 function cmdCampaigns(msg) {
   const list = db.listCampaigns(msg.from.id);
-  if (!list.length) return bot.sendMessage(msg.chat.id, 'No campaigns. Use /new.');
-  bot.sendMessage(msg.chat.id, list.map((c) =>
-    `#${c.id} "${c.name}" → ${c.status}, sent: ${c.sent_total}${c.last_error ? ' ⚠ ' + c.last_error : ''}`
-  ).join('\n'));
+  if (!list.length) {
+    return sendEphemeral(msg, 'No campaigns. Use /new.');
+  }
+  // One header line + per-campaign row of action buttons. Status emoji
+  // makes it scannable without parsing text. Pause/Run/Stop choose
+  // dynamically based on current status — only buttons that make sense
+  // are shown for that row.
+  const text = list.map((c) => {
+    const dot = c.status === 'running' ? '🟢'
+              : c.status === 'paused' ? '⏸'
+              : c.status === 'error' ? '🔴'
+              : '⚫';
+    return `${dot} #${c.id} "${c.name}" — ${c.status}, sent ${c.sent_total}` +
+      (c.last_error ? ` ⚠ ${c.last_error.slice(0, 60)}` : '');
+  }).join('\n');
+  const keyboard = list.flatMap((c) => buildCampaignKeyboard(c));
+  return bot.sendMessage(msg.chat.id, text, {
+    reply_markup: { inline_keyboard: keyboard },
+  });
 }
 
 function cmdNew(msg, account_id) {
@@ -258,7 +368,7 @@ function cmdStats(msg, id) {
   const opLine = bs.opSummary
     ? `Last op refresh: ${freshestOpAge(bs.opSummary)}`
     : 'Last op refresh: unknown';
-  bot.sendMessage(msg.chat.id,
+  return bot.sendMessage(msg.chat.id,
     `#${id} "${c.name}" — ${c.status}\n` +
     `Sent total: ${c.sent_total}, last hour: ${lastHour}\n` +
     `Cap: ${cap}/h (~${dailyEst}/day with current sleep window)\n` +
@@ -267,7 +377,10 @@ function cmdStats(msg, id) {
     `${bridgeLine}\n` +
     `${opLine}\n` +
     `Last action: ${c.last_action_at ? new Date(c.last_action_at).toISOString() : 'never'}\n` +
-    (c.last_error ? `⚠ ${c.last_error}` : ''));
+    (c.last_error ? `⚠ ${c.last_error}` : ''),
+    {
+      reply_markup: { inline_keyboard: buildCampaignKeyboard(c, /* compact */ false) },
+    });
 }
 
 function ageSec(ts) {
@@ -399,5 +512,171 @@ function stepNewCampaign(msg, conv) {
       `✓ Campaign #${id} "${conv.draft.name}" created.\n` +
       `Defaults: max ${cfg.pacing.maxRepliesPerHour}/h, delay ${cfg.pacing.minDelaySec}-${cfg.pacing.maxDelaySec}s.\n` +
       `Use /run ${id} to start.`);
+  }
+}
+
+
+
+// ---------- /diagnose ----------
+//
+// Shows a one-screen health check: bridge connectivity + which X.com
+// GraphQL ops the extension has captured + how to fix what's missing.
+// Helps the user self-serve "why isn't it replying" without us asking
+// for log dumps.
+//
+// The KNOWN_OPS list is the set we currently care about. HomeTimeline +
+// CreateTweet are mandatory for the autoreply runner. UserByScreenName
+// is informational — we don't strictly need it, but it's a good signal
+// that the user has actually browsed x.com after extension load.
+const KNOWN_OPS = [
+  { name: 'HomeTimeline', required: true,
+    fix: 'open x.com/home and let the feed load (auto-warmup also does this)' },
+  { name: 'HomeLatestTimeline', required: false,
+    fix: 'switch the X home feed to "Latest" once' },
+  { name: 'CreateTweet', required: true,
+    fix: 'post any tweet manually on x.com — even just "gm" — once. ' +
+         'Captured shape persists across Chrome restarts.' },
+  { name: 'UserByScreenName', required: false,
+    fix: 'visit any user profile on x.com once' },
+];
+
+function cmdDiagnose(msg, _id) {
+  const bs = bridge.status();
+  const lines = [];
+  if (bs.connected) {
+    lines.push(`Bridge: ✓ @${bs.handle} (v${bs.extVersion || '?'}, last pong ${ageSec(bs.lastPongAt)}s ago)`);
+  } else {
+    lines.push('Bridge: ✗ not connected');
+    lines.push('  → start Chrome, open x.com, ensure extension is enabled.');
+    lines.push('  → check extension Options: bridge URL ws://127.0.0.1:8787 + token.');
+  }
+  lines.push('');
+  lines.push('Captured GraphQL ops:');
+  const ops = bs.opSummary || {};
+  let missingRequired = 0;
+  for (const o of KNOWN_OPS) {
+    const info = ops[o.name];
+    if (info && info.lastSeen) {
+      const minutesAgo = Math.round((Date.now() - info.lastSeen) / 60000);
+      lines.push(`  ✓ ${o.name} — seen ${minutesAgo} min ago`);
+    } else {
+      const tag = o.required ? '✗ required' : '· optional';
+      lines.push(`  ${tag}: ${o.name}`);
+      if (o.required) {
+        missingRequired++;
+        lines.push(`     fix: ${o.fix}`);
+      }
+    }
+  }
+  if (missingRequired === 0 && bs.connected) {
+    lines.push('');
+    lines.push('All required ops captured. Bot can reply normally.');
+  }
+  return sendEphemeral(msg, lines.join('\n'));
+}
+
+// ---------- inline keyboards ----------
+//
+// Telegram callback_data has a 64-byte limit per button, and there's no
+// way to attach extra context — so we encode the action and target in a
+// short colon-separated string: "<action>:<id>" or "<action>:<id>:<arg>".
+// All callback handlers MUST authorize on q.from.id before mutating
+// state — Telegram doesn't gate inline buttons by allowed-list.
+
+function buildCampaignKeyboard(c, compact = true) {
+  // Row 1: dynamic primary action — Run if not running, Pause if
+  // running, then Stop (always available). Shown regardless of compact.
+  const row1 = [];
+  if (c.status === 'running') {
+    row1.push({ text: '⏸ Pause', callback_data: `pause:${c.id}` });
+  } else {
+    row1.push({ text: '▶ Run', callback_data: `run:${c.id}` });
+  }
+  if (c.status !== 'idle') {
+    row1.push({ text: '🛑 Stop', callback_data: `stop:${c.id}` });
+  }
+  row1.push({ text: '📊 Stats', callback_data: `stats:${c.id}` });
+
+  if (compact) {
+    // List view — keep it to ONE row per campaign, otherwise the screen
+    // gets noisy with many campaigns. Stats button on row1 lets the user
+    // drill in.
+    return [row1];
+  }
+
+  // Detail view (/stats <id>) — extra row with secondary actions.
+  const row2 = [
+    { text: '🔍 Logs', callback_data: `logs:${c.id}` },
+    { text: '🩺 Diagnose', callback_data: `diagnose:${c.id}` },
+  ];
+  const row3 = [
+    { text: '🐢 safe', callback_data: `preset:${c.id}:safe` },
+    { text: '🚶 medium', callback_data: `preset:${c.id}:medium` },
+    { text: '🚀 highvolume', callback_data: `preset:${c.id}:highvolume` },
+  ];
+  // Sleep toggle reflects current state so the button text isn't a lie.
+  let sleepEnabled = false;
+  try { sleepEnabled = !!JSON.parse(c.config_json)?.sleep?.enabled; } catch {}
+  const row4 = [
+    sleepEnabled
+      ? { text: '☀️ Sleep OFF', callback_data: `sleep:${c.id}:off` }
+      : { text: '🌙 Sleep ON', callback_data: `sleep:${c.id}:on` },
+  ];
+  return [row1, row2, row3, row4];
+}
+
+async function handleCallback(q) {
+  // Authorization first — reject silently to anyone not in the allowed
+  // list. answerCallbackQuery just makes the spinner go away on the
+  // user's button click.
+  if (!allowed(q.from?.id)) {
+    return bot.answerCallbackQuery(q.id, { text: 'Unauthorized', show_alert: false });
+  }
+  const data = q.data || '';
+  const [action, idStr, arg] = data.split(':');
+  const id = +idStr;
+  // Synthesize a minimal `msg` shim for cmd* functions. They expect
+  // .from, .chat, .message_id (used by sendEphemeral for cleanup).
+  // We use the bot's reply message id, since the user's "command" here
+  // is a button press — there's no user-typed message to clean up.
+  const fakeMsg = {
+    from: q.from,
+    chat: q.message.chat,
+    message_id: q.message.message_id,
+  };
+
+  try {
+    switch (action) {
+      case 'run':
+        cmdRun(fakeMsg, id);
+        break;
+      case 'pause':
+        cmdSetStatus(fakeMsg, id, 'paused');
+        break;
+      case 'stop':
+        cmdSetStatus(fakeMsg, id, 'idle');
+        break;
+      case 'stats':
+        cmdStats(fakeMsg, id);
+        break;
+      case 'logs':
+        cmdLogs(fakeMsg, id);
+        break;
+      case 'diagnose':
+        cmdDiagnose(fakeMsg, id);
+        break;
+      case 'preset':
+        cmdPreset(fakeMsg, id, arg);
+        break;
+      case 'sleep':
+        cmdSleep(fakeMsg, id, arg);
+        break;
+      default:
+        await bot.answerCallbackQuery(q.id, { text: `Unknown action: ${action}` });
+        return;
+    }
+    await bot.answerCallbackQuery(q.id);
+  } catch (e) {
+    await bot.answerCallbackQuery(q.id, { text: `Error: ${e.message}`.slice(0, 200), show_alert: true });
   }
 }
