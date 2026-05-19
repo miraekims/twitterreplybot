@@ -65,9 +65,29 @@ let lastPushedSummary = null;     // dedup repeated identical pushes
 let _rpcHandler = null;           // set by index.js — handles inbound rpc.req
 
 const DEFAULTS = {
-  url: 'ws://host.docker.internal:8787',
+  // Why 127.0.0.1 and not host.docker.internal:
+  //
+  // The bot's docker-compose publishes 8787 to 127.0.0.1:8787 on the host
+  // (look at the PORTS column of `docker compose ps`). The Chrome
+  // extension runs on the host, not inside a container, so it must hit
+  // the published address — i.e. ws://127.0.0.1:8787.
+  //
+  // host.docker.internal is the *opposite* direction: it resolves from
+  // inside a container to the host. Trying to use it from a host-side
+  // Chrome SW silently fails on Mac/Docker Desktop with
+  // "Connection closed before receiving a handshake response" because
+  // Docker Desktop's name resolution is one-way.
+  //
+  // 172.17.0.1 is the Linux-only docker0 bridge IP and doesn't exist on
+  // Mac. It's left in host_permissions for the rare Linux+native-Docker
+  // user who'd manually swap to it.
+  url: 'ws://127.0.0.1:8787',
   token: '',
 };
+
+// Track whether we've already complained about a missing token in this SW
+// lifetime, so the per-minute keepalive watchdog doesn't fill the console.
+let loggedNoToken = false;
 
 export async function getBridgeSettings() {
   const cur = (await storage.get(SETTINGS_KEY, {})) || {};
@@ -77,6 +97,10 @@ export async function getBridgeSettings() {
 export async function setBridgeSettings(patch) {
   const next = { ...(await getBridgeSettings()), ...(patch || {}) };
   await storage.set(SETTINGS_KEY, next);
+  // Reset the once-per-life "no token" complaint flag — if the user just
+  // pasted a token, they should see a fresh log line if it's still
+  // somehow missing or invalid. And conversely if they cleared it.
+  loggedNoToken = false;
   // Force-reconnect with new settings.
   disconnect();
   scheduleReconnect(0);
@@ -111,9 +135,14 @@ export function disconnect() {
 }
 
 // Public — used by keepalive watchdog. If we're already healthy, no-op.
-export function ensureConnected() {
+// Also no-op if the user hasn't configured a token yet — otherwise the
+// watchdog would call us once a minute, and connect() would re-log
+// "no token configured" each time, drowning the SW console.
+export async function ensureConnected() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   if (ws && ws.readyState === WebSocket.CONNECTING) return;
+  const { token } = await getBridgeSettings();
+  if (!token) return;
   scheduleReconnect(0);
 }
 
@@ -167,12 +196,19 @@ async function buildOpSummary() {
 async function connect() {
   const { url, token } = await getBridgeSettings();
   if (!token) {
-    console.warn('[xbot bridge] no token configured — open extension Options to set it');
+    if (!loggedNoToken) {
+      console.warn('[xbot bridge] no token configured — open extension Options to set it');
+      loggedNoToken = true;
+    }
     await setStatus({ connected: false, lastError: 'no token configured' });
-    // No point retrying every second when there's no token. Long backoff.
-    reconnectAttempt = 5;
+    // Don't schedule a retry — we'll connect when setBridgeSettings is
+    // called with a token. The minute-watchdog also bails on missing
+    // token, so nothing else will revive us here.
     return;
   }
+  // From this point on token is set. If it later becomes unset we want
+  // to re-log once.
+  loggedNoToken = false;
 
   console.log(`[xbot bridge] connecting to ${url} ...`);
   await setStatus({ connected: false, connecting: true, lastError: null });

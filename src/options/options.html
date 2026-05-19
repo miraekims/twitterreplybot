@@ -20,13 +20,17 @@
        Both must agree on a URL and a shared token.</p>
 
     <label for="url">Bridge URL</label>
-    <input id="url" type="text" />
-    <div class="hint">Default: <code>ws://host.docker.internal:8787</code> (Docker Desktop on Mac/Win).
-       On Linux without Desktop, use <code>ws://172.17.0.1:8787</code> or expose via host network.</div>
+    <input id="url" type="text" placeholder="ws://127.0.0.1:8787" />
+    <div class="hint">Default: <code>ws://127.0.0.1:8787</code> — works for the standard
+       <code>docker compose up</code> setup on Mac, Windows and Linux. (The compose
+       file publishes 8787 to <code>127.0.0.1</code>; check
+       <code>docker compose ps</code> if in doubt.)</div>
 
     <label for="token">Shared token</label>
-    <input id="token" type="text" autocomplete="off" />
-    <div class="hint">Must match <code>XBOT_BRIDGE_TOKEN</code> in <code>bot/.env</code>.</div>
+    <input id="token" type="text" autocomplete="off" placeholder="paste from bot/.env" />
+    <div class="hint">Must match <code>XBOT_BRIDGE_TOKEN</code> in <code>bot/.env</code>.
+       Note: removing and re-loading the extension wipes this — you'll need to paste
+       it again.</div>
 
     <button id="save">Save & reconnect</button>
 
