@@ -112,6 +112,7 @@ export function defaultCampaignConfig(presetName = 'safe') {
     sleep: baseSleep(),
     replyToCommenters: true, // reply to commenters under whale posts (safer than replying to authors)
     autoDraft: true,         // auto-generate and schedule 3-6 posts/day from feed topics
+    autoReplyOwn: true,      // auto-reply to comments on own posts within 5 min (x150 algo boost)
   };
 }
 
