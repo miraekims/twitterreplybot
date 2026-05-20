@@ -589,6 +589,43 @@ async function showSettings() {
         </div>
       </div>
 
+      <div class="section-title">Engagement & Quality</div>
+
+      <div class="card">
+        <h3>Quality Gate (min score to send)</h3>
+        <div class="slider-container">
+          <span style="font-size:11px;">1</span>
+          <input type="range" id="s-quality" min="1" max="10" value="${pacing.qualityThreshold || 5}" oninput="document.getElementById('quality-label').textContent=this.value+'/10'">
+          <span style="font-size:11px;">10</span>
+        </div>
+        <div class="slider-val" id="quality-label" style="text-align:center; margin-top:4px;">${pacing.qualityThreshold || 5}/10</div>
+        <div class="hint">Replies scored below this are skipped. Higher = fewer but better replies. 5 recommended.</div>
+      </div>
+
+      <div class="card">
+        <h3>Min Likes on tweet (to reply)</h3>
+        <div class="field">
+          <input type="number" id="s-minLikes2" value="${filters.minLikes || 2}">
+          <div class="hint">Only reply to tweets with at least this many likes. 2+ = proven engagement.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Min Author Followers</h3>
+        <div class="field">
+          <input type="number" id="s-minFollowers2" value="${filters.minAuthorFollowers || 50}">
+          <div class="hint">Skip accounts with fewer followers (low visibility for your reply).</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Max Tweet Age (minutes)</h3>
+        <div class="field">
+          <input type="number" id="s-maxAge" value="${filters.maxAgeMinutes || 120}">
+          <div class="hint">Only reply to tweets newer than this. 120 = 2 hours. Fresher = more visibility.</div>
+        </div>
+      </div>
+
       <button class="btn btn-success" onclick="saveSettings()">Save Campaign</button>
 
       <div class="section-title" style="margin-top:28px;">AI Engine</div>
@@ -666,17 +703,19 @@ async function saveSettings() {
   const nicheRaw = document.getElementById('s-niche')?.value || '';
   const nicheKw = nicheRaw.split(',').map(s => s.trim()).filter(Boolean);
   const preset = document.getElementById('s-preset')?.value;
-  const minFollowers = parseInt(document.getElementById('s-minFollowers')?.value) || 0;
-  const minLikes = parseInt(document.getElementById('s-minLikes')?.value) || 0;
+  const minFollowers = parseInt(document.getElementById('s-minFollowers2')?.value || document.getElementById('s-minFollowers')?.value) || 0;
+  const minLikes = parseInt(document.getElementById('s-minLikes2')?.value || document.getElementById('s-minLikes')?.value) || 0;
   const langs = (document.getElementById('s-langs')?.value || '').split(',').map(s => s.trim()).filter(Boolean);
+  const qualityThreshold = parseInt(document.getElementById('s-quality')?.value) || 5;
+  const maxAgeMinutes = parseInt(document.getElementById('s-maxAge')?.value) || 120;
 
   try {
     await put(`/campaign/${c.id}/config`, {
       keywords,
       templates,
       preset: preset || undefined,
-      pacing: { commenterRatio: ratio },
-      filters: { whaleNicheKeywords: nicheKw, minAuthorFollowers: minFollowers, minLikes, langs },
+      pacing: { commenterRatio: ratio, qualityThreshold },
+      filters: { whaleNicheKeywords: nicheKw, minAuthorFollowers: minFollowers, minLikes, langs, maxAgeMinutes },
     });
     toast('Settings saved!');
     // Refresh campaign data

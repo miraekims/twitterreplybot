@@ -120,9 +120,9 @@ export async function scoreReply({ replyText, tweetText, tweetAuthor, persona })
 
 /**
  * Optional quality gate — returns true if the reply should be sent.
- * Default threshold: 4 (skip obvious spam-tier replies).
+ * Default threshold: 5 (skip generic/forgettable replies to protect engagement rate).
  */
-export function passesQualityGate(score, threshold = 4) {
+export function passesQualityGate(score, threshold = 5) {
   if (score === null) return true; // If scoring fails, don't block
   return score >= threshold;
 }

@@ -23,10 +23,17 @@ const baseFilters = () => ({
   // top of whatever the user's follow graph already pre-selected. With a
   // well-curated account, defaults can be much looser than they used to
   // be when we were hitting wide-open SearchTimeline.
-  minLikes: 0,
-  minTweetAgeSec: 30,       // give X a moment to drop fake-engagement spam
-  maxAgeMinutes: 240,       // 4 hours — feed delivers fresh stuff anyway
-  minAuthorFollowers: 0,
+  //
+  // ENGAGEMENT RATE STRATEGY: We set minLikes=2 by default so the bot
+  // only replies to tweets that already have SOME social proof. Tweets
+  // with 0 likes are either brand new (nobody sees our reply) or simply
+  // uninteresting (replying won't get engagement). This single filter
+  // dramatically improves engagement rate by ensuring we reply where
+  // people are actually reading.
+  minLikes: 2,
+  minTweetAgeSec: 60,       // give X a moment to surface engagement
+  maxAgeMinutes: 120,       // 2 hours — fresher tweets get more visibility
+  minAuthorFollowers: 50,   // skip accounts with <50 followers (low visibility)
   langs: ['en'],
   skipReplies: true,
   skipRetweets: true,

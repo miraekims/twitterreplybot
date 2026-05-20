@@ -327,7 +327,7 @@ export async function tickCampaign(campaign) {
       tweetAuthor: t.authorHandle,
       persona: cfg.persona,
     });
-    if (qualityScore !== null && !passesQualityGate(qualityScore, cfg.pacing.qualityThreshold || 4)) {
+    if (qualityScore !== null && !passesQualityGate(qualityScore, cfg.pacing.qualityThreshold || 5)) {
       logger.info('runner', `c${campaign.id} skip ${t.id} — quality score ${qualityScore} below threshold`, campaign.id);
       return;
     }
