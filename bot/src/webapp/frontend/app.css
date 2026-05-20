@@ -44,6 +44,12 @@
   --shadow-1: 0 2px 8px rgba(0, 0, 0, 0.3);
   --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.4);
   --shadow-3: 0 12px 32px rgba(45, 191, 72, 0.2);
+
+  /* Bottom nav reservation. Nav bar height (~76px on phones) + safe-area
+     inset (iOS Home Indicator, ~34px) + breathing room (32px) so the
+     last button never sits under the nav. */
+  --nav-height: 76px;
+  --nav-reserve: calc(var(--nav-height) + env(safe-area-inset-bottom, 0px) + 32px);
 }
 
 html, body { height: 100%; }
@@ -53,7 +59,7 @@ body {
   font-size: 15px;
   color: var(--text);
   min-height: 100vh;
-  padding: 16px 16px 180px;
+  padding: 16px 16px var(--nav-reserve);
   -webkit-font-smoothing: antialiased;
   letter-spacing: -0.005em;
   background: radial-gradient(80% 50% at 50% 0%, var(--bg-grad-top) 0%, transparent 70%), var(--bg-grad-bot);
@@ -141,11 +147,50 @@ input[type="range"] { -webkit-appearance: none; width: 100%; height: 6px; backgr
 input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: var(--card); border: 3px solid var(--green); box-shadow: 0 4px 10px rgba(45,191,72,0.3); cursor: pointer; }
 .field select { appearance: none; padding-right: 36px; }
 
-/* Bottom Nav — floating pill, HIGH z-index, clear spacing */
-.nav { position: fixed; bottom: 0; left: 0; right: 0; max-width: 480px; margin: 0 auto; display: flex; z-index: 9999; padding: 10px 12px; background: rgba(24,28,36,0.96); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); border-radius: 22px 22px 0 0; box-shadow: 0 -4px 24px rgba(0,0,0,0.5); padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
-.nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 8px 4px; font-size: 11px; font-weight: 600; color: var(--text-3); cursor: pointer; transition: color .2s ease, background .2s ease; border-radius: 16px; -webkit-tap-highlight-color: transparent; }
+/* Bottom Nav — pinned to very bottom of viewport, fixed height,
+   never overlaps content because body has --nav-reserve padding-bottom. */
+.nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  max-width: 480px;
+  margin: 0 auto;
+  display: flex;
+  z-index: 9999;
+  padding: 6px 8px;
+  padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+  background: rgba(13, 15, 20, 0.96);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
+}
+.nav-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color .2s ease, background .2s ease;
+  border-radius: 14px;
+  -webkit-tap-highlight-color: transparent;
+}
 .nav-item:active { transform: scale(0.94); }
-.nav-item .icon { font-size: 22px; display: flex; align-items: center; justify-content: center; line-height: 1; color: var(--text-3); transition: color .2s ease; }
+.nav-item .icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  color: var(--text-3);
+  transition: color .2s ease;
+}
 .nav-item .icon svg { width: 22px; height: 22px; }
 .nav-item.active { color: var(--green); background: var(--green-soft); }
 .nav-item.active .icon { color: var(--green); }
@@ -180,7 +225,7 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 22p
 .tag:hover { background: var(--green-soft); color: var(--green); border-color: var(--green-l); }
 .tag.active { background: var(--green); color: #053b13; border-color: var(--green); box-shadow: 0 4px 10px rgba(45,191,72,0.3); }
 
-.toast { position: fixed; bottom: 120px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--card); color: var(--green); padding: 12px 20px; border-radius: 999px; font-size: 13px; font-weight: 600; z-index: 10000; opacity: 0; transition: opacity .25s ease, transform .25s ease; pointer-events: none; box-shadow: var(--shadow-2), 0 0 0 1px var(--green-l); }
+.toast { position: fixed; bottom: calc(var(--nav-reserve) + 8px); left: 50%; transform: translateX(-50%) translateY(20px); background: var(--card); color: var(--green); padding: 12px 20px; border-radius: 999px; font-size: 13px; font-weight: 600; z-index: 10000; opacity: 0; transition: opacity .25s ease, transform .25s ease; pointer-events: none; box-shadow: var(--shadow-2), 0 0 0 1px var(--green-l); }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 .log-list { max-height: 360px; overflow-y: auto; background: var(--card); border-radius: var(--r-md); padding: 12px 14px; box-shadow: var(--shadow-1); }
