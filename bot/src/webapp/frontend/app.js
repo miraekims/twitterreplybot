@@ -185,17 +185,26 @@ function renderCampaignItem(c) {
   `;
 }
 
+// SVG icons — Blum outline style (24x24, stroke-based)
+const NAV_ICONS = {
+  home: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5L12 3l9 7.5V20a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V10.5z"/><path d="M9 21V14h6v7"/></svg>`,
+  growth: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20l4-4 4 2 4-6 6-4"/><circle cx="21" cy="8" r="2"/><path d="M3 20h18"/></svg>`,
+  queue: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="11" width="18" height="5" rx="1.5"/><path d="M7 19h10"/></svg>`,
+  tune: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83"/></svg>`,
+  logs: `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M7 8h10M7 12h6M7 16h8"/></svg>`,
+};
+
 function renderNav(active) {
   const items = [
-    { id: 'home',     icon: '🏡', label: 'Home' },
-    { id: 'premium',  icon: '⭐', label: 'Premium' },
-    { id: 'settings', icon: '🎯', label: 'Tune' },
-    { id: 'ai',       icon: '✨', label: 'AI' },
-    { id: 'logs',     icon: '📊', label: 'Logs' },
+    { id: 'home',   label: 'Home' },
+    { id: 'growth', label: 'Growth' },
+    { id: 'queue',  label: 'Queue' },
+    { id: 'tune',   label: 'Tune' },
+    { id: 'logs',   label: 'Logs' },
   ];
   return `<nav class="nav">${items.map(i =>
     `<div class="nav-item ${i.id === active ? 'active' : ''}" onclick="navTo('${i.id}')">
-      <span class="icon">${i.icon}</span>${i.label}
+      <span class="icon">${NAV_ICONS[i.id]}</span>${i.label}
     </div>`
   ).join('')}</nav>`;
 }
@@ -204,9 +213,9 @@ function renderNav(active) {
 // ---------- Navigation ----------
 async function navTo(tab) {
   if (tab === 'home') return showDashboard();
-  if (tab === 'premium') return showPremium();
-  if (tab === 'settings') return showSettings();
-  if (tab === 'ai') return showAiSettings();
+  if (tab === 'growth') return showGrowth();
+  if (tab === 'queue') return showQueue();
+  if (tab === 'tune') return showSettings();
   if (tab === 'logs') return showLogs();
 }
 
@@ -492,8 +501,8 @@ async function submitWizard() {
 }
 
 
-// ---------- Settings screen ----------
-function showSettings() {
+// ---------- Tune screen (Settings + AI combined) ----------
+async function showSettings() {
   const c = state.currentCampaign;
   if (!c) { toast('No campaign selected'); return; }
   const cfg = c.config || {};
@@ -502,10 +511,21 @@ function showSettings() {
   const ratio = pacing.commenterRatio ?? 0.5;
   const nicheKw = (filters.whaleNicheKeywords || []).join(', ');
 
+  // Fetch AI settings
+  let aiSettings = [];
+  try {
+    const res = await get('/settings');
+    aiSettings = res.settings || [];
+  } catch {}
+  const getAiVal = (key) => { const s = aiSettings.find(x => x.key === key); return s ? s.value : ''; };
+  const hasKey = aiSettings.find(x => x.key === 'OPENAI_API_KEY')?.hasValue;
+
   render(`
     <div id="settings" class="screen active">
-      <div class="wizard-title">Settings</div>
+      <div class="wizard-title">Tune</div>
       <div class="wizard-subtitle">${c.name} (@${c.handle})</div>
+
+      <div class="section-title">Campaign</div>
 
       <div class="card">
         <h3>Keywords</h3>
@@ -569,11 +589,44 @@ function showSettings() {
         </div>
       </div>
 
-      <button class="btn btn-success" onclick="saveSettings()">Save All</button>
+      <button class="btn btn-success" onclick="saveSettings()">Save Campaign</button>
+
+      <div class="section-title" style="margin-top:28px;">AI Engine</div>
+
+      <div class="card ${hasKey ? 'success-card' : 'warn-card'}">
+        <h3>Status</h3>
+        <p>${hasKey ? '✅ AI active — persona-aware replies' : '⚠️ No AI key — using literal templates'}</p>
+      </div>
+
+      <div class="card">
+        <h3>API Key</h3>
+        <div class="field">
+          <input type="password" id="ai-key" placeholder="sk-..." value="">
+          <div class="hint">OpenAI, Groq, or compatible. Current: ${getAiVal('OPENAI_API_KEY') || 'not set'}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Model</h3>
+        <div class="field">
+          <input type="text" id="ai-model" placeholder="gpt-4o" value="${getAiVal('OPENAI_MODEL') || ''}">
+          <div class="hint">e.g. gpt-4o, llama-3.3-70b-versatile</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Base URL</h3>
+        <div class="field">
+          <input type="text" id="ai-url" placeholder="https://api.openai.com/v1" value="${getAiVal('OPENAI_BASE_URL') || ''}">
+          <div class="hint">For Groq: https://api.groq.com/openai/v1</div>
+        </div>
+      </div>
+
+      <button class="btn btn-success" onclick="saveAiSettings()">Save AI</button>
       <div style="height:12px;"></div>
       <button class="btn btn-outline" onclick="showDashboard()">Back to Dashboard</button>
 
-      ${renderNav('settings')}
+      ${renderNav('tune')}
     </div>
   `);
 }
@@ -637,63 +690,6 @@ async function saveSettings() {
 }
 
 
-// ---------- AI Settings screen ----------
-async function showAiSettings() {
-  let settings = [];
-  try {
-    const res = await get('/settings');
-    settings = res.settings || [];
-  } catch {}
-
-  const getVal = (key) => {
-    const s = settings.find(x => x.key === key);
-    return s ? (s.key.includes('KEY') ? s.value : s.value) : '';
-  };
-  const hasKey = settings.find(x => x.key === 'OPENAI_API_KEY')?.hasValue;
-
-  render(`
-    <div id="ai-settings" class="screen active">
-      <div class="wizard-title">AI Settings</div>
-      <div class="wizard-subtitle">Configure OpenAI/Groq for persona-aware replies and /draft generation</div>
-
-      <div class="card ${hasKey ? 'success-card' : 'warn-card'}">
-        <h3>Status</h3>
-        <p>${hasKey ? '✅ AI key configured — replies are persona-aware' : '⚠️ No AI key — using literal templates only'}</p>
-      </div>
-
-      <div class="card">
-        <h3>API Key</h3>
-        <div class="field">
-          <input type="password" id="ai-key" placeholder="sk-..." value="">
-          <div class="hint">OpenAI, Groq, or any OpenAI-compatible key. Current: ${getVal('OPENAI_API_KEY') || 'not set'}</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Model</h3>
-        <div class="field">
-          <input type="text" id="ai-model" placeholder="gpt-4o" value="${getVal('OPENAI_MODEL') || ''}">
-          <div class="hint">e.g. gpt-4o, gpt-4o-mini, llama-3.1-70b-versatile (for Groq)</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>Base URL (optional)</h3>
-        <div class="field">
-          <input type="text" id="ai-url" placeholder="https://api.openai.com/v1" value="${getVal('OPENAI_BASE_URL') || ''}">
-          <div class="hint">For Groq: https://api.groq.com/openai/v1 — leave empty for OpenAI default</div>
-        </div>
-      </div>
-
-      <button class="btn btn-success" onclick="saveAiSettings()">Save AI Settings</button>
-      <div style="height:12px;"></div>
-      <button class="btn btn-outline" onclick="showDashboard()">Back</button>
-
-      ${renderNav('ai')}
-    </div>
-  `);
-}
-
 async function saveAiSettings() {
   const key = document.getElementById('ai-key')?.value?.trim();
   const model = document.getElementById('ai-model')?.value?.trim();
@@ -712,6 +708,124 @@ async function saveAiSettings() {
   } catch {
     toast('Error saving');
   }
+}
+
+
+// ---------- Growth screen ----------
+async function showGrowth() {
+  const c = state.currentCampaign;
+  if (!c) { toast('No campaign selected'); return; }
+
+  // Fetch stats from API (graceful fallback if endpoint doesn't exist yet)
+  let growth = { followersGained: 0, followBackRate: 0, bestHours: [], totalImpressions: 0, topReplies: [] };
+  try {
+    const res = await get(`/campaign/${c.id}/growth`);
+    if (res && !res.error) growth = res;
+  } catch {}
+
+  const bestHoursText = growth.bestHours?.length
+    ? growth.bestHours.map(h => `${h}:00`).join(', ')
+    : 'Collecting data...';
+
+  render(`
+    <div id="growth" class="screen active">
+      <div class="wizard-title">Growth</div>
+      <div class="wizard-subtitle">Auto-tracked engagement metrics for @${c.handle}</div>
+
+      <div class="hero-card">
+        <div class="label">Follow-back rate</div>
+        <div class="big">${growth.followBackRate || 0}%</div>
+        <div class="small">replies that converted to follows</div>
+      </div>
+
+      <div class="stats-row" style="margin-top:12px;">
+        <div class="card">
+          <h3>Followers gained</h3>
+          <div class="value">${growth.followersGained || 0}</div>
+          <div class="sub">this week</div>
+        </div>
+        <div class="card">
+          <h3>Impressions</h3>
+          <div class="value">${growth.totalImpressions || 0}</div>
+          <div class="sub">from replies</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px;">
+        <h3>Best performing hours</h3>
+        <p style="font-size:15px; font-weight:700; color:var(--green);">${bestHoursText}</p>
+        <div class="sub">Bot auto-adjusts activity to these windows</div>
+      </div>
+
+      ${growth.topReplies?.length ? `
+        <div class="section-title">Top replies this week</div>
+        ${growth.topReplies.slice(0, 5).map(r => `
+          <div class="card">
+            <p style="font-size:13px;">${escHtml(r.text || '')}</p>
+            <div class="sub" style="margin-top:6px;">❤️ ${r.likes || 0} &middot; 🔁 ${r.retweets || 0} &middot; replied to @${r.target || '?'}</div>
+          </div>
+        `).join('')}
+      ` : `
+        <div class="card" style="margin-top:12px;">
+          <h3>Top replies</h3>
+          <p style="color:var(--text-3);">Will appear after first 24h of activity</p>
+        </div>
+      `}
+
+      ${renderNav('growth')}
+    </div>
+  `);
+}
+
+
+// ---------- Queue screen ----------
+async function showQueue() {
+  const c = state.currentCampaign;
+  if (!c) { toast('No campaign selected'); return; }
+
+  let queue = { recent: [], autoDisabled: [] };
+  try {
+    const res = await get(`/campaign/${c.id}/queue`);
+    if (res && !res.error) queue = res;
+  } catch {}
+
+  render(`
+    <div id="queue" class="screen active">
+      <div class="wizard-title">Queue</div>
+      <div class="wizard-subtitle">Recent replies sent by bot &middot; auto quality tracking</div>
+
+      ${queue.autoDisabled?.length ? `
+        <div class="card warn-card">
+          <h3>Auto-disabled templates</h3>
+          <p style="font-size:13px;">These templates got 0 engagement after 20+ uses and were automatically paused:</p>
+          <div style="margin-top:8px;">
+            ${queue.autoDisabled.map(t => `<div style="font-size:12px; color:var(--text-3); padding:4px 0; border-bottom:1px solid var(--line);">${escHtml(t)}</div>`).join('')}
+          </div>
+        </div>
+      ` : ''}
+
+      <div class="section-title">Last 20 replies</div>
+      ${queue.recent?.length ? queue.recent.map(r => {
+        const scoreColor = r.score >= 7 ? 'var(--green)' : r.score >= 4 ? 'var(--warn)' : 'var(--danger)';
+        const time = r.ts ? new Date(r.ts).toLocaleTimeString() : '';
+        return `
+          <div class="card" style="padding:14px;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+              <p style="font-size:13px; flex:1;">${escHtml(r.text || '')}</p>
+              <span style="font-size:11px; font-weight:700; color:${scoreColor}; white-space:nowrap;">${r.score != null ? r.score + '/10' : '—'}</span>
+            </div>
+            <div class="sub" style="margin-top:6px;">→ @${r.target || '?'} &middot; ${time}${r.likes ? ' &middot; ❤️' + r.likes : ''}</div>
+          </div>
+        `;
+      }).join('') : `
+        <div class="card">
+          <p style="color:var(--text-3);">No replies sent yet. Start campaign to see activity here.</p>
+        </div>
+      `}
+
+      ${renderNav('queue')}
+    </div>
+  `);
 }
 
 
