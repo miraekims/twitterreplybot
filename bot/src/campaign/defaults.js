@@ -34,6 +34,14 @@ const baseFilters = () => ({
   skipWithUrls: false,
   blacklistWords: [],
   blacklistHandles: [],
+  // Whale niche filter: only drill into posts from whales whose bio OR
+  // post text contains at least one of these keywords. Empty = no filter
+  // (all whales pass). Default: crypto-related terms.
+  whaleNicheKeywords: [
+    'crypto', 'bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol',
+    'defi', 'web3', 'nft', 'blockchain', 'trading', 'trader',
+    'degen', 'altcoin', 'memecoin', 'onchain', 'airdrop',
+  ],
 });
 
 // Sleep is OFF by default. The user can enable it via /preset or by
@@ -61,6 +69,9 @@ export const PRESETS = {
     // feed (which would otherwise never produce two consecutive empty
     // pages) still cycles back to the top to pick up fresh tweets.
     cursorRefreshMin: 30,
+    // Balance between commenter-replies (under whale posts) and feed-replies
+    // (direct to tweet authors). 0.5 = 50/50, 1.0 = only commenters, 0 = only feed.
+    commenterRatio: 0.5,
   },
   medium: {
     minDelaySec: 25,
@@ -70,6 +81,7 @@ export const PRESETS = {
     diversityCooldownSec: 1200,
     authorCooldownHours: 24,
     cursorRefreshMin: 30,
+    commenterRatio: 0.5,
   },
   // 1000 replies/day target. With sleep OFF (default now) we have all 24
   // active hours and a hard hourly cap of 50 ⇒ 1200/day ceiling. With
@@ -90,6 +102,7 @@ export const PRESETS = {
     // Tighter on highvolume: feed is consumed faster, refresh-to-top
     // more often so we don't reply to stale tweets older than 15min.
     cursorRefreshMin: 15,
+    commenterRatio: 0.5,
   },
 };
 

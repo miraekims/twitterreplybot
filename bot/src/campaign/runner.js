@@ -193,12 +193,20 @@ export async function tickCampaign(campaign) {
   // Refill queue from HomeTimeline if empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
-    // Try commenter-reply mode first (higher engagement value)
-    const didCommenterReply = await tickCommenterReply(campaign, cfg, client);
-    if (didCommenterReply) {
-      const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
-      nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
-      return;
+    // 50/50 balance: flip a coin weighted by commenterRatio to decide
+    // whether this tick attempts a commenter-reply or a feed-reply.
+    // Fallback: if the chosen mode has nothing, try the other.
+    const ratio = cfg.pacing.commenterRatio ?? 0.5;
+    const tryCommenterFirst = Math.random() < ratio;
+
+    if (tryCommenterFirst) {
+      const didCommenterReply = await tickCommenterReply(campaign, cfg, client);
+      if (didCommenterReply) {
+        const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+        nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
+        return;
+      }
+      // Commenter queue empty — fall through to feed
     }
 
     if (lastScrollEmpty.get(campaign.id)) {
@@ -223,7 +231,19 @@ export async function tickCampaign(campaign) {
       }
       return;
     }
-    if (queue.length === 0) return;
+    if (queue.length === 0) {
+      // Feed empty — if we hadn't tried commenter yet (coin chose feed first),
+      // try commenter as fallback.
+      if (!tryCommenterFirst) {
+        const didCommenterReply = await tickCommenterReply(campaign, cfg, client);
+        if (didCommenterReply) {
+          const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+          nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
+          return;
+        }
+      }
+      return;
+    }
   }
 
   // Pop one and reply. Skip on the fly if:
@@ -655,12 +675,26 @@ async function runCommenterScan(client, campaign, cfg) {
     throw e;
   }
 
-  // Filter for whale posts: high author followers + has replies
+  // Filter for whale posts: high author followers + has replies + niche match
+  const nicheKeywords = cfg.filters?.whaleNicheKeywords || [];
   const whalePosts = (resp.tweets || []).filter((t) => {
     if (!t || !t.id) return false;
     if ((t.authorFollowers || 0) < minFollowers) return false;
     if ((t.replyCount || 0) < MIN_POST_REPLIES) return false;
     if (t.isReply || t.isRetweet) return false;
+    // Niche filter: if whaleNicheKeywords is non-empty, the whale's post
+    // text OR author bio must contain at least one keyword. This ensures
+    // we only reply under crypto-relevant whale posts, not random celebrities.
+    if (nicheKeywords.length > 0) {
+      const haystack = [
+        (t.text || ''),
+        (t.authorBio || ''),
+      ].join(' ').toLowerCase();
+      const matchesNiche = nicheKeywords.some((kw) =>
+        haystack.includes(kw.toLowerCase()),
+      );
+      if (!matchesNiche) return false;
+    }
     return true;
   });
 

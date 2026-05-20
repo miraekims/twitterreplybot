@@ -21,6 +21,7 @@ import { startBridgeServer, bridge } from './bridge/server.js';
 import { startPostsRunner } from './posts/scheduler.js';
 import { startAutoDraft } from './posts/auto-draft.js';
 import { startAutoReplyOwn } from './posts/auto-reply-own.js';
+import { startWebApp } from './webapp/server.js';
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -77,6 +78,10 @@ async function main() {
   startAutoDraft();
   startAutoReplyOwn();
   startTelegram();
+
+  // Mini App HTTP server for Telegram Web App interface
+  const webAppPort = parseInt(process.env.WEBAPP_PORT || '8788', 10);
+  startWebApp({ port: webAppPort });
 
   process.on('SIGINT', () => {
     logger.info('boot', 'SIGINT — shutting down');

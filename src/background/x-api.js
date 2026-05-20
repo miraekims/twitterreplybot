@@ -361,6 +361,7 @@ function extractReplies(data, parentId) {
           authorHandle: uLegacy?.screen_name || u?.core?.screen_name || null,
           authorName: uLegacy?.name || u?.core?.name || null,
           authorFollowers: uLegacy?.followers_count || u?.followers_count || 0,
+          authorBio: uLegacy?.description || u?.core?.description || u?.description || '',
           favoriteCount: tw.favorite_count || 0,
           createdAt: tw.created_at || null,
         });
@@ -412,6 +413,7 @@ function extractTweets(data) {
         authorHandle: handle,
         authorName: name,
         authorFollowers: followers,
+        authorBio: u?.description || uCore?.description || userResult?.description || '',
       });
     }
     for (const k of Object.keys(node)) stack.push(node[k]);

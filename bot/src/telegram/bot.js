@@ -89,6 +89,8 @@ export function startTelegram() {
   bot.onText(/^\/draft(?:\s+([\s\S]+))?$/, (m, mt) => guard(m, () => cmdDraft(m, mt[1])));
   // /queue — list posts queued/drafted for user's campaigns.
   bot.onText(/^\/queue$/, (m) => guard(m, () => cmdQueue(m)));
+  // /app — open the Mini App (web-based UI for campaign management)
+  bot.onText(/^\/app$/, (m) => guard(m, () => cmdApp(m)));
   // /posts <id> — show recent posts for a campaign.
   bot.onText(/^\/posts(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdPosts(m, mt[1] && +mt[1])));
   // /apikey — manage OpenAI/Anthropic/Groq API key from Telegram. No args
@@ -186,6 +188,9 @@ const HELP = [
   '/apikey — set/manage OpenAI/Groq/custom API key (no restart needed)',
   '',
   'Tip: type "/" in chat to get a native popup with all commands.',
+  '',
+  'Mini App:',
+  '/app — open the visual dashboard (no commands needed!)',
 ].join('\n');
 
 // One-line descriptions for setMyCommands. Telegram caps these at 256 chars
@@ -213,6 +218,7 @@ const COMMAND_LIST = [
   { command: 'queue', description: 'List queued/drafted posts' },
   { command: 'posts', description: 'Recent posts — /posts <id>' },
   { command: 'apikey', description: 'Set OpenAI/Groq API key' },
+  { command: 'app', description: 'Open Mini App — visual dashboard' },
 ];
 
 async function registerCommands() {
@@ -1161,6 +1167,22 @@ function cmdQueue(msg) {
         },
       });
   }
+}
+
+// ---------- /app — open Mini App ----------
+function cmdApp(msg) {
+  const webAppUrl = process.env.WEBAPP_URL || `http://localhost:${process.env.WEBAPP_PORT || '8788'}`;
+  bot.sendMessage(msg.chat.id,
+    '🚀 Open the Mini App for a visual dashboard — no commands needed!\n\n' +
+    'Tap the button below to manage campaigns, settings, AI, and logs.',
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '📱 Open Mini App', web_app: { url: webAppUrl } },
+        ]],
+      },
+    },
+  );
 }
 
 // ---------- /posts — recent posts for a campaign ----------
