@@ -98,6 +98,18 @@ export const db = {
       );
       CREATE INDEX IF NOT EXISTS idx_posts_campaign_status ON posts(campaign_id, status);
       CREATE INDEX IF NOT EXISTS idx_posts_due ON posts(status, scheduled_at);
+
+      -- Runtime app settings — small key/value store for things the user
+      -- changes via Telegram (rather than restarting the container with
+      -- a new .env). Today: OPENAI_API_KEY / OPENAI_MODEL /
+      -- OPENAI_BASE_URL set via /apikey command. Loaded on boot in
+      -- index.js, applied to process.env so persona.js + draft.js see
+      -- them at call time.
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
   },
 
@@ -306,5 +318,38 @@ export const db = {
   pruneOldDrafts(maxAgeMs = 24 * 3600 * 1000) {
     const cutoff = Date.now() - maxAgeMs;
     _db.prepare(`DELETE FROM posts WHERE status = 'draft' AND created_at < ?`).run(cutoff);
+  },
+
+  // ---------- app settings (runtime config from /apikey) ----------
+  //
+  // Tiny KV store for env-style settings that the user changes via
+  // Telegram. Today: OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL.
+  // index.js loads these on boot into process.env so persona.js and
+  // draft.js (which call readConfig() on each generation request) see
+  // them transparently.
+  //
+  // Why DB and not a config file: the bot runs in Docker, the user is
+  // on Telegram. They shouldn't have to ssh into the container or
+  // edit .env to change a key. Container restart is also unnecessary —
+  // we update process.env in-place on /apikey set.
+  getSetting(key) {
+    const row = _db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
+    return row ? row.value : null;
+  },
+  setSetting(key, value) {
+    _db.prepare(`
+      INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(key, String(value), Date.now());
+  },
+  deleteSetting(key) {
+    _db.prepare(`DELETE FROM app_settings WHERE key = ?`).run(key);
+  },
+  /**
+   * For debug — returns all settings with masked values. Used by
+   * /apikey (no args) to show current state without leaking the key.
+   */
+  listSettings() {
+    return _db.prepare(`SELECT key, value, updated_at FROM app_settings ORDER BY key`).all();
   },
 };
