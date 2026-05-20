@@ -248,27 +248,46 @@ export async function tickCampaign(campaign) {
       if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
     }
     tpl = pickTemplate(cfg.templates, t);
-    if (!tpl) {
+    if (!tpl && !process.env.OPENAI_API_KEY) {
       const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown>';
       logger.info(
         'runner',
-        `c${campaign.id} skip ${t.id} (${who}) — no template matched topic`,
+        `c${campaign.id} skip ${t.id} (${who}) — no template matched topic (set OPENAI_API_KEY for auto-reply)`,
         campaign.id,
       );
       continue;
     }
     break;
   }
-  if (!t || !tpl) return;
+  if (!t) return;
   let text;
   try {
-    text = await rewriteTemplate({
-      template: tpl.text,
-      tweet: t,
-      persona: cfg.persona,
-    });
+    if (tpl) {
+      // Template exists — use it as direction for AI rewrite
+      text = await rewriteTemplate({
+        template: tpl.text,
+        tweet: t,
+        persona: cfg.persona,
+      });
+    } else {
+      // No template matched but AI is available — generate a pure AI reply
+      // based on the tweet content and persona. This is the "templateless"
+      // mode: the bot reads the tweet and crafts a contextual, substantive
+      // reply without needing a pre-defined direction.
+      text = await rewriteTemplate({
+        template: 'write a substantive, engaging reply that adds value to this conversation',
+        tweet: t,
+        persona: cfg.persona,
+      });
+    }
   } catch (e) {
-    text = literalSubstitute(tpl.text, t);
+    if (tpl) {
+      text = literalSubstitute(tpl.text, t);
+    } else {
+      const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown>';
+      logger.warn('runner', `c${campaign.id} skip ${t.id} (${who}) — AI failed and no template: ${e.message}`, campaign.id);
+      return;
+    }
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
 
