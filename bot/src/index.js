@@ -44,6 +44,22 @@ async function main() {
 
   await db.init();
   logger.info('boot', `db ready at ${db.path}`);
+
+  // Load AI config from DB into process.env if not already present in
+  // the host env. Lets the user change OPENAI_API_KEY via /apikey
+  // without restarting the container — persona.js and draft.js
+  // re-read process.env on every generation, so this is enough.
+  // Env always wins over DB so a Docker-defined key takes precedence
+  // and survives accidental DB resets.
+  for (const k of ['OPENAI_API_KEY', 'OPENAI_MODEL', 'OPENAI_BASE_URL']) {
+    if (process.env[k]) continue;
+    const v = db.getSetting(k);
+    if (v) {
+      process.env[k] = v;
+      logger.info('boot', `loaded ${k} from app_settings`);
+    }
+  }
+
   logger.info('boot', `persona AI: ${aiActivationSummary()}`);
 
   startBridgeServer({ port: bridgePort, token: bridgeToken });

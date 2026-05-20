@@ -85,6 +85,11 @@ export function startTelegram() {
   bot.onText(/^\/queue$/, (m) => guard(m, () => cmdQueue(m)));
   // /posts <id> — show recent posts for a campaign.
   bot.onText(/^\/posts(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdPosts(m, mt[1] && +mt[1])));
+  // /apikey — manage OpenAI/Anthropic/Groq API key from Telegram. No args
+  // shows status + button menu; subcommands set/clear/url/model edit
+  // individual fields. The /draft engine re-reads process.env on every
+  // call, so changes apply without a restart.
+  bot.onText(/^\/apikey(?:\s+(.+))?$/, (m, mt) => guard(m, () => cmdApiKey(m, mt[1])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
   bot.on('callback_query', (q) => handleCallback(q).catch((e) => {
     logger.warn('tg', `callback: ${e && e.message}`);
@@ -171,6 +176,7 @@ const HELP = [
   '/draft <topic> — AI generates 3 candidates in your persona voice',
   '/queue — list drafts + scheduled posts',
   '/posts <id> — recent posts for a campaign',
+  '/apikey — set/manage OpenAI/Groq/custom API key (no restart needed)',
   '',
   'Tip: type "/" in chat to get a native popup with all commands.',
 ].join('\n');
@@ -198,6 +204,7 @@ const COMMAND_LIST = [
   { command: 'draft', description: 'AI candidates — /draft <topic>' },
   { command: 'queue', description: 'List queued/drafted posts' },
   { command: 'posts', description: 'Recent posts — /posts <id>' },
+  { command: 'apikey', description: 'Set OpenAI/Groq API key' },
 ];
 
 async function registerCommands() {
@@ -500,6 +507,7 @@ function handleConversation(msg) {
   const conv = conversations.get(msg.chat.id);
   if (!conv) return;
   if (conv.kind === 'newCampaign') return stepNewCampaign(msg, conv);
+  if (conv.kind === 'apikeyInput') return stepApiKeyInput(msg, conv);
 }
 
 function stepNewCampaign(msg, conv) {
@@ -756,6 +764,11 @@ async function handleCallback(q) {
         // Cancel a queued post from /queue. callback_data: pcancel:<postId>
         await handlePostCancel(q, idStr);
         break;
+      case 'apikey':
+        // /apikey button menu. callback_data: apikey:<action>
+        // action ∈ openai | groq | custom | clear | show
+        await handleApiKeyAction(q, idStr);
+        break;
       default:
         await bot.answerCallbackQuery(q.id, { text: `Unknown action: ${action}` });
         return;
@@ -885,7 +898,10 @@ function buildMainMenuKeyboard() {
       { text: '📝 Posts',     callback_data: 'menu:posts' },
     ],
     [
+      { text: '🔑 API key',   callback_data: 'menu:apikey' },
       { text: '🩺 Diagnose',  callback_data: 'menu:diagnose' },
+    ],
+    [
       { text: '❓ Help',       callback_data: 'menu:help' },
     ],
   ];
@@ -945,6 +961,8 @@ async function handleMenuClick(q, section) {
         'daily cap 6 by default.');
     case 'diagnose':
       return cmdDiagnose(fakeMsg);
+    case 'apikey':
+      return cmdApiKey(fakeMsg);
     case 'help':
       return sendEphemeral(fakeMsg, HELP);
     default:
@@ -1282,4 +1300,230 @@ function cancelSiblingDrafts(approvedPost) {
     if (p.topic !== approvedPost.topic) continue;
     db.cancelPost(p.id);
   }
+}
+
+
+
+
+// ---------- /apikey — runtime AI provider config ----------
+//
+// User-friendly panel for setting OPENAI_API_KEY / OPENAI_MODEL /
+// OPENAI_BASE_URL without restarting the container or editing .env.
+//
+// Why one command and not three: 95% of users want to do "set my
+// OpenAI key" once, and never touch model/url. Default flow is
+// `/apikey` → tap "🔑 OpenAI" → paste key → done. Power users
+// (Groq, custom proxies, model overrides) tap into the same panel.
+//
+// Storage: db.app_settings table. On change we update process.env
+// directly so the next /draft call uses it without restart. On
+// container boot, index.js loads from DB into process.env (env
+// always wins so a Docker-defined key takes precedence).
+//
+// Security note: the input message containing the raw key is
+// deleted from the chat after we save it, so it doesn't sit in
+// scrollback or get exposed via screenshot. Best-effort — Telegram
+// caches messages on the server side regardless.
+
+// We support these as separate "providers" because they need
+// different baseUrl + model defaults. Adding a provider = one
+// entry here, no other code changes.
+const API_PROVIDERS = {
+  openai: {
+    label: '🔑 OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    suggestedModel: 'gpt-4o-mini',
+    keyHint: 'Get one at platform.openai.com/api-keys (paid, ~$0.0002/reply for 4o-mini)',
+  },
+  groq: {
+    label: '⚡ Groq (free)',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    suggestedModel: 'llama-3.3-70b-versatile',
+    keyHint: 'Get a free key at console.groq.com/keys — generous free tier, fast Llama 70B',
+  },
+  anthropic: {
+    label: '🧠 Anthropic (Claude)',
+    // Anthropic does NOT offer OpenAI-compatible mode natively. The
+    // only zero-code path is a translating proxy. Recommended:
+    // claude-bridge or LiteLLM. We document this when the user picks
+    // anthropic so they know the extra hop is required.
+    baseUrl: 'https://api.anthropic.com/v1',
+    suggestedModel: 'claude-3-5-sonnet-20241022',
+    keyHint: 'Anthropic API is NOT OpenAI-compatible. You need a proxy ' +
+             '(e.g. LiteLLM at https://docs.litellm.ai) — set baseUrl to ' +
+             'the proxy, paste your sk-ant-... key, model = claude-3-5-sonnet.',
+  },
+};
+
+function maskKey(key) {
+  if (!key) return '(unset)';
+  if (key.length < 10) return '***';
+  return `${key.slice(0, 6)}...${key.slice(-4)} (${key.length} chars)`;
+}
+
+// Active config, read live from process.env. Same source persona.js
+// + draft.js read on every call, so what we display here is
+// guaranteed to match what /draft will actually use.
+function currentApiConfig() {
+  return {
+    key: process.env.OPENAI_API_KEY || '',
+    model: process.env.OPENAI_MODEL || '(default: gpt-4o-mini)',
+    baseUrl: process.env.OPENAI_BASE_URL || '(default: api.openai.com)',
+  };
+}
+
+function cmdApiKey(msg, sub) {
+  // /apikey alone → status panel. /apikey clear / /apikey set /
+  // /apikey model / /apikey url for explicit subcommands.
+  if (sub) {
+    const [cmd, ...rest] = sub.trim().split(/\s+/);
+    const arg = rest.join(' ');
+    if (cmd === 'set' && arg) return applyApiKey(msg.chat.id, arg);
+    if (cmd === 'clear') return clearApiKey(msg.chat.id);
+    if (cmd === 'model' && arg) return applyApiSetting(msg.chat.id, 'OPENAI_MODEL', arg);
+    if (cmd === 'url' && arg) return applyApiSetting(msg.chat.id, 'OPENAI_BASE_URL', arg);
+    return bot.sendMessage(msg.chat.id,
+      'Usage:\n' +
+      '  /apikey            — status + button menu\n' +
+      '  /apikey set <key>  — paste an OpenAI/Groq/etc API key\n' +
+      '  /apikey model <m>  — override OPENAI_MODEL\n' +
+      '  /apikey url <u>    — override OPENAI_BASE_URL\n' +
+      '  /apikey clear      — remove all AI config from DB');
+  }
+
+  const cfg = currentApiConfig();
+  const status = cfg.key
+    ? `✓ active — ${maskKey(cfg.key)}\n   model: ${cfg.model}\n   url: ${cfg.baseUrl}`
+    : '✗ not set — AI replies disabled, /draft will fail';
+  return bot.sendMessage(msg.chat.id,
+    `🔑 AI provider config\n\n${status}\n\n` +
+    `Pick a provider and paste your key — I save it in the DB and apply ` +
+    `to process.env so /draft and AI replies start working immediately.`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: API_PROVIDERS.openai.label, callback_data: 'apikey:openai' },
+            { text: API_PROVIDERS.groq.label,   callback_data: 'apikey:groq' },
+          ],
+          [
+            { text: API_PROVIDERS.anthropic.label, callback_data: 'apikey:anthropic' },
+            { text: '🌐 Custom URL', callback_data: 'apikey:custom' },
+          ],
+          [
+            { text: '🗑 Clear all', callback_data: 'apikey:clear' },
+          ],
+        ],
+      },
+    });
+}
+
+async function handleApiKeyAction(q, action) {
+  const chatId = q.message.chat.id;
+  if (action === 'clear') return clearApiKey(chatId);
+
+  const provider = API_PROVIDERS[action];
+  if (!provider && action !== 'custom') {
+    return bot.sendMessage(chatId, `Unknown action: ${action}`);
+  }
+
+  if (action === 'custom') {
+    // For custom: collect baseUrl first, then key. Two-step conversation.
+    conversations.set(chatId, {
+      kind: 'apikeyInput',
+      step: 'baseUrl',
+      data: {},
+    });
+    return bot.sendMessage(chatId,
+      'Custom provider — paste the OpenAI-compatible base URL ' +
+      '(e.g. `https://api.together.xyz/v1` or your own proxy).\n\n' +
+      'After this you will be asked for the API key.',
+      { parse_mode: 'Markdown' });
+  }
+
+  // Known provider — pre-fill baseUrl and model, ask only for the key.
+  // Apply baseUrl + model immediately; key arrives in next user message.
+  db.setSetting('OPENAI_BASE_URL', provider.baseUrl);
+  db.setSetting('OPENAI_MODEL', provider.suggestedModel);
+  process.env.OPENAI_BASE_URL = provider.baseUrl;
+  process.env.OPENAI_MODEL = provider.suggestedModel;
+
+  conversations.set(chatId, {
+    kind: 'apikeyInput',
+    step: 'key',
+    data: { provider: action },
+  });
+
+  return bot.sendMessage(chatId,
+    `${provider.label} selected.\n\n` +
+    `${provider.keyHint}\n\n` +
+    `Paste your API key as the next message. I delete the message after ` +
+    `saving so it doesn't sit in chat history.`);
+}
+
+function stepApiKeyInput(msg, conv) {
+  const text = msg.text.trim();
+
+  if (conv.step === 'baseUrl') {
+    // Light validation — must be a URL-shaped string. Don't try to be
+    // clever with regex; the actual call will fail loudly if wrong.
+    if (!text.startsWith('http://') && !text.startsWith('https://')) {
+      return bot.sendMessage(msg.chat.id,
+        'Base URL must start with http:// or https://. Try again, or /apikey to restart.');
+    }
+    conv.data.baseUrl = text.replace(/\/$/, '');
+    conv.step = 'key';
+    return bot.sendMessage(msg.chat.id,
+      `Base URL saved: ${conv.data.baseUrl}\n\n` +
+      'Now paste the API key (will be saved + this message deleted).');
+  }
+
+  if (conv.step === 'key') {
+    // Apply settings.
+    if (conv.data.baseUrl) {
+      db.setSetting('OPENAI_BASE_URL', conv.data.baseUrl);
+      process.env.OPENAI_BASE_URL = conv.data.baseUrl;
+    }
+    db.setSetting('OPENAI_API_KEY', text);
+    process.env.OPENAI_API_KEY = text;
+    conversations.delete(msg.chat.id);
+
+    // Best-effort delete the message containing the secret. Telegram
+    // requires the message to be <48h old, which is always true here.
+    if (msg.message_id) {
+      bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+    }
+
+    const cfg = currentApiConfig();
+    return bot.sendMessage(msg.chat.id,
+      `✅ API key saved (${maskKey(cfg.key)}).\n\n` +
+      `Active config:\n` +
+      `  model: ${cfg.model}\n` +
+      `  url: ${cfg.baseUrl}\n\n` +
+      `Test it with /draft <topic> — should generate 3 candidates in ~10s.`);
+  }
+}
+
+function applyApiKey(chatId, key) {
+  db.setSetting('OPENAI_API_KEY', key);
+  process.env.OPENAI_API_KEY = key;
+  return bot.sendMessage(chatId, `✅ API key saved (${maskKey(key)}). Try /draft <topic>.`);
+}
+
+function applyApiSetting(chatId, envKey, value) {
+  db.setSetting(envKey, value);
+  process.env[envKey] = value;
+  return bot.sendMessage(chatId, `✅ ${envKey} = ${value}`);
+}
+
+function clearApiKey(chatId) {
+  db.deleteSetting('OPENAI_API_KEY');
+  db.deleteSetting('OPENAI_MODEL');
+  db.deleteSetting('OPENAI_BASE_URL');
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_MODEL;
+  delete process.env.OPENAI_BASE_URL;
+  return bot.sendMessage(chatId,
+    '🗑 Cleared OPENAI_API_KEY / OPENAI_MODEL / OPENAI_BASE_URL.\n\n' +
+    'AI replies and /draft are now disabled. Use /apikey to set up again.');
 }
