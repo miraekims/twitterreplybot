@@ -193,6 +193,14 @@ export async function tickCampaign(campaign) {
   // Refill queue from HomeTimeline if empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
+    // Try commenter-reply mode first (higher engagement value)
+    const didCommenterReply = await tickCommenterReply(campaign, cfg, client);
+    if (didCommenterReply) {
+      const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+      nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
+      return;
+    }
+
     if (lastScrollEmpty.get(campaign.id)) {
       const sinceScroll = Date.now() - (campaign.last_search_at || 0);
       if (campaign.last_search_at && sinceScroll < (cfg.pacing.searchEverySec || 90) * 1000) return;
@@ -582,4 +590,220 @@ export function getRecentFeedSample(limit = 20) {
   return [...feedSnapshot]
     .sort((a, b) => (b.favoriteCount || 0) - (a.favoriteCount || 0))
     .slice(0, limit);
+}
+
+// ---- Reply-to-commenters mode ----
+//
+// Instead of replying to the original tweet author (which X flags as spam
+// when done at scale), we reply to COMMENTERS under whale posts. This is:
+//   1. Less visible to the original author (they don't get a notification)
+//   2. More natural (you're joining a conversation, not cold-pitching)
+//   3. Targets engaged users (someone who comments on a whale post with
+//      50k+ followers is likely serious / has capital)
+//
+// Flow:
+//   1. From HomeTimeline, pick tweets with high engagement + author 50k+ followers
+//   2. Fetch TweetDetail for those (gets the reply thread)
+//   3. Filter commenters: skip bots, skip already-replied, apply persona
+//   4. Reply to the commenter's reply (replyToTweetId = commenter's tweet id)
+//
+// This runs as a secondary queue alongside the normal feed-reply mode.
+// Campaigns with `cfg.replyToCommenters: true` activate it (default: true
+// for new campaigns going forward).
+
+const commenterQueues = new Map();        // campaign_id → commenter-tweet[]
+const lastCommenterScan = new Map();      // campaign_id → timestamp
+const COMMENTER_SCAN_INTERVAL_MS = 5 * 60_000; // scan whale posts every 5 min
+const MIN_WHALE_FOLLOWERS = 10000;        // target posts from accounts with 10k+
+const MIN_POST_REPLIES = 5;               // only drill into posts that have replies
+const MAX_COMMENTERS_PER_POST = 5;        // don't reply to more than 5 per thread
+
+/**
+ * Scan HomeTimeline for whale posts, fetch their comments, and queue
+ * commenter tweets for reply. Called from tickCampaign when the normal
+ * queue is empty and enough time has passed since last scan.
+ */
+async function runCommenterScan(client, campaign, cfg) {
+  const minFollowers = cfg.filters?.minWhaleFollowers || MIN_WHALE_FOLLOWERS;
+
+  // Use the same HomeTimeline data we already have (don't double-fetch).
+  // Pull a fresh page specifically looking for high-engagement posts.
+  let resp;
+  try {
+    resp = await client.homeTimeline({ count: 40 });
+  } catch (e) {
+    if (e.code === 'BRIDGE_DISCONNECTED') throw e;
+    throw e;
+  }
+
+  // Filter for whale posts: high author followers + has replies
+  const whalePosts = (resp.tweets || []).filter((t) => {
+    if (!t || !t.id) return false;
+    if ((t.authorFollowers || 0) < minFollowers) return false;
+    if ((t.replyCount || 0) < MIN_POST_REPLIES) return false;
+    if (t.isReply || t.isRetweet) return false;
+    return true;
+  });
+
+  if (!whalePosts.length) {
+    logger.info('runner', `c${campaign.id} commenter-scan: no whale posts found (need ${minFollowers}+ followers)`, campaign.id);
+    return [];
+  }
+
+  // Pick up to 3 whale posts to drill into (don't overwhelm with TweetDetail calls)
+  const selected = whalePosts
+    .sort((a, b) => (b.replyCount || 0) - (a.replyCount || 0))
+    .slice(0, 3);
+
+  const allCommenters = [];
+  const cooldownMsAuthor = (cfg.pacing?.authorCooldownHours ?? 24) * 3600_000;
+
+  for (const post of selected) {
+    try {
+      const detail = await client.tweetDetail({ tweetId: post.id });
+      const replies = detail.replies || [];
+
+      let added = 0;
+      for (const reply of replies) {
+        if (added >= MAX_COMMENTERS_PER_POST) break;
+        if (!reply.id || !reply.text || !reply.authorHandle) continue;
+        // Skip if it's the original author replying to their own post
+        if (reply.authorHandle === post.authorHandle) continue;
+        // Skip if already replied to this commenter's tweet
+        if (db.isSent(campaign.id, reply.id)) continue;
+        // Skip if author is on cooldown
+        if (cooldownMsAuthor > 0) {
+          const lastTs = db.lastAuthorReplyTs(campaign.id, reply.authorHandle);
+          if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
+        }
+        // Skip very short / low-effort comments (likely bots)
+        if (reply.text.length < 15) continue;
+        // Skip comments with 0 likes if the post has many replies (quality filter)
+        if ((reply.favoriteCount || 0) === 0 && replies.length > 20) continue;
+
+        allCommenters.push({
+          ...reply,
+          _parentPostId: post.id,
+          _parentAuthor: post.authorHandle,
+          _parentText: post.text?.slice(0, 200) || '',
+        });
+        added++;
+      }
+    } catch (e) {
+      logger.warn('runner', `c${campaign.id} TweetDetail for ${post.id}: ${e.message}`, campaign.id);
+      // Don't fail the whole scan if one TweetDetail errors
+    }
+  }
+
+  logger.info(
+    'runner',
+    `c${campaign.id} commenter-scan: ${selected.length} whale posts → ${allCommenters.length} commenters queued`,
+    campaign.id,
+  );
+  return allCommenters;
+}
+
+/**
+ * Extended tickCampaign logic for commenter replies. Called when the
+ * normal reply queue is empty and replyToCommenters is enabled.
+ * Returns true if a reply was made (so the caller skips normal flow).
+ */
+export async function tickCommenterReply(campaign, cfg, client) {
+  // Check if commenter mode is enabled (default: true)
+  if (cfg.replyToCommenters === false) return false;
+
+  // Throttle scans
+  const lastScan = lastCommenterScan.get(campaign.id) || 0;
+  let queue = commenterQueues.get(campaign.id) || [];
+
+  if (queue.length === 0 && Date.now() - lastScan > COMMENTER_SCAN_INTERVAL_MS) {
+    try {
+      queue = await runCommenterScan(client, campaign, cfg);
+      commenterQueues.set(campaign.id, queue);
+      lastCommenterScan.set(campaign.id, Date.now());
+    } catch (e) {
+      logger.warn('runner', `c${campaign.id} commenter-scan failed: ${e.message}`, campaign.id);
+      return false;
+    }
+  }
+
+  if (queue.length === 0) return false;
+
+  // Pop one commenter and reply
+  const target = queue.shift();
+  commenterQueues.set(campaign.id, queue);
+
+  if (!target || db.isSent(campaign.id, target.id)) return false;
+
+  // Generate reply text using AI — context includes both the original post
+  // and the commenter's reply so the bot's response is contextually relevant
+  let text;
+  try {
+    const { rewriteTemplate } = await import('../persona/persona.js');
+    text = await rewriteTemplate({
+      template: 'engage naturally with this commenter, add value to the discussion',
+      tweet: {
+        id: target.id,
+        text: target.text,
+        authorHandle: target.authorHandle,
+        _parentContext: `Original post by @${target._parentAuthor}: "${target._parentText}"`,
+      },
+      persona: cfg.persona,
+    });
+  } catch (e) {
+    // Fallback: use a template from the campaign
+    const tpl = pickTemplateForCommenter(cfg.templates, target);
+    if (tpl) {
+      const { literalSubstitute } = await import('../persona/persona.js');
+      text = literalSubstitute(tpl.text, target);
+    } else {
+      logger.info('runner', `c${campaign.id} skip commenter ${target.authorHandle} — no template/AI`, campaign.id);
+      return false;
+    }
+  }
+
+  if (!text || text.length > 280) {
+    text = text ? text.slice(0, 277) + '...' : null;
+    if (!text) return false;
+  }
+
+  try {
+    await client.createTweet({ text, replyToTweetId: target.id });
+    db.markSent(campaign.id, target.id);
+    if (target.authorHandle) db.markAuthorReplied(campaign.id, target.authorHandle);
+    db.bumpCampaignAction(campaign.id, 'reply');
+    clearMissingOpDebounce();
+    logger.info(
+      'runner',
+      `c${campaign.id} replied to commenter @${target.authorHandle} ` +
+      `(under @${target._parentAuthor}'s post ${target._parentPostId})`,
+      campaign.id,
+    );
+    return true;
+  } catch (e) {
+    logger.error('runner', `c${campaign.id} commenter reply failed: ${e.message}`, campaign.id);
+    db.markSent(campaign.id, target.id); // don't retry failed tweets
+    if (e.code === 'BRIDGE_DISCONNECTED') return false;
+    if (e.status === 401 || e.status === 403 || e.status === 429) {
+      db.setCampaignStatus(campaign.id, 'error', e.message);
+    }
+    return false;
+  }
+}
+
+// Pick a template that matches the commenter's text
+function pickTemplateForCommenter(templates, commenter) {
+  if (!Array.isArray(templates) || templates.length === 0) return null;
+  const norm = templates.map(toCanonicalTemplate).filter(Boolean);
+  if (!norm.length) return null;
+  const lower = (commenter?.text || '').toLowerCase();
+  const matched = [];
+  const catchall = [];
+  for (const t of norm) {
+    if (!t.match || t.match.length === 0) { catchall.push(t); continue; }
+    if (t.match.some((tag) => allTokensPresent(tag, lower))) matched.push(t);
+  }
+  const pool = matched.length ? matched : catchall;
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random() * pool.length)];
 }

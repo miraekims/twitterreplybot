@@ -110,6 +110,7 @@ export function defaultCampaignConfig(presetName = 'safe') {
     filters: baseFilters(),
     pacing: presetPacing(presetName),
     sleep: baseSleep(),
+    replyToCommenters: true, // reply to commenters under whale posts (safer than replying to authors)
   };
 }
 

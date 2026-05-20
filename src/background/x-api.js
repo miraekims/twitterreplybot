@@ -355,10 +355,14 @@ function extractReplies(data, parentId) {
       if (tw.in_reply_to_status_id_str === String(parentId)) {
         seen.add(id);
         const u = node.core?.user_results?.result || node.tweet?.core?.user_results?.result;
+        const uLegacy = u?.legacy || null;
         out.push({
           id, text: tw.full_text || '',
-          authorHandle: u?.legacy?.screen_name || null,
-          authorName: u?.legacy?.name || null,
+          authorHandle: uLegacy?.screen_name || u?.core?.screen_name || null,
+          authorName: uLegacy?.name || u?.core?.name || null,
+          authorFollowers: uLegacy?.followers_count || u?.followers_count || 0,
+          favoriteCount: tw.favorite_count || 0,
+          createdAt: tw.created_at || null,
         });
       }
     }
