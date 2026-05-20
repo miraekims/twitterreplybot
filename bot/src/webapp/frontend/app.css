@@ -53,7 +53,7 @@ body {
   font-size: 15px;
   color: var(--text);
   min-height: 100vh;
-  padding: 16px 16px 140px;
+  padding: 16px 16px 180px;
   -webkit-font-smoothing: antialiased;
   letter-spacing: -0.005em;
   background: radial-gradient(80% 50% at 50% 0%, var(--bg-grad-top) 0%, transparent 70%), var(--bg-grad-bot);
@@ -142,11 +142,11 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 22p
 .field select { appearance: none; padding-right: 36px; }
 
 /* Bottom Nav — floating pill, HIGH z-index, clear spacing */
-.nav { position: fixed; bottom: 12px; left: 12px; right: 12px; max-width: 456px; margin: 0 auto; display: flex; z-index: 9999; padding: 8px; background: rgba(24,28,36,0.92); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); border-radius: 22px; box-shadow: 0 12px 32px rgba(0,0,0,0.5); padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px)); }
-.nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 8px 4px; font-size: 11px; font-weight: 600; color: var(--text-3); cursor: pointer; transition: color .2s ease, background .2s ease; border-radius: 16px; }
+.nav { position: fixed; bottom: 0; left: 0; right: 0; max-width: 480px; margin: 0 auto; display: flex; z-index: 9999; padding: 10px 12px; background: rgba(24,28,36,0.96); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); border-radius: 22px 22px 0 0; box-shadow: 0 -4px 24px rgba(0,0,0,0.5); padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
+.nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 8px 4px; font-size: 11px; font-weight: 600; color: var(--text-3); cursor: pointer; transition: color .2s ease, background .2s ease; border-radius: 16px; -webkit-tap-highlight-color: transparent; }
 .nav-item:active { transform: scale(0.94); }
 .nav-item .icon { font-size: 22px; display: flex; align-items: center; justify-content: center; line-height: 1; color: var(--text-3); transition: color .2s ease; }
-.nav-item .icon svg { width: 24px; height: 24px; }
+.nav-item .icon svg { width: 22px; height: 22px; }
 .nav-item.active { color: var(--green); background: var(--green-soft); }
 .nav-item.active .icon { color: var(--green); }
 

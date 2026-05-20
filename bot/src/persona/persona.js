@@ -210,5 +210,28 @@ function buildSystemPrompt(p) {
     'alone, or any agreement-only reply. Never use 🚀🔥💎✨ emoji. ' +
     'Stay in voice. Be specific to the tweet, not generic.',
   );
+
+  // ENGAGEMENT RATE PRIORITY.
+  //
+  // X's algorithm classifies accounts by engagement rate on their
+  // replies — likes_received / replies_sent. Below 1% engagement
+  // rate, X starts suppressing replies (shadow-ban). Above 3%, X
+  // amplifies them. This is the SINGLE most important metric.
+  //
+  // Sacrifice volume for quality: one reply that gets 5 likes is
+  // worth more than 10 replies that get 0. The bot MUST NOT send
+  // forgettable filler replies. Every reply must have a reason for
+  // a stranger to tap the heart button.
+  parts.push(
+    'CRITICAL: Your engagement rate (likes per reply) determines ' +
+    'whether X shows or hides your replies. A reply with 0 likes ' +
+    'HURTS the account. Only write replies worth liking. If you ' +
+    'cannot write something a stranger would like, it is better to ' +
+    'say nothing. Make every reply: (a) have a surprising insight, ' +
+    '(b) state a specific number or date, (c) make a bold prediction, ' +
+    'or (d) compress a complex idea into <15 words that make people ' +
+    'stop scrolling. Generic agreement is NEVER acceptable.',
+  );
+
   return parts.join(' ');
 }
