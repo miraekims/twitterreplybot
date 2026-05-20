@@ -22,6 +22,8 @@ import { startPostsRunner } from './posts/scheduler.js';
 import { startAutoDraft } from './posts/auto-draft.js';
 import { startAutoReplyOwn } from './posts/auto-reply-own.js';
 import { startWebApp } from './webapp/server.js';
+import { startEngagementChecker } from './campaign/engagement.js';
+import { startAutoPrune } from './campaign/auto-prune.js';
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -77,6 +79,8 @@ async function main() {
   startPostsRunner();
   startAutoDraft();
   startAutoReplyOwn();
+  startEngagementChecker();
+  startAutoPrune();
   startTelegram();
 
   // Mini App HTTP server for Telegram Web App interface

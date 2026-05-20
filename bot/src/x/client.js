@@ -47,6 +47,27 @@ export class XClient {
     return rpc('x.createTweet', { text, replyToTweetId });
   }
 
+  /**
+   * Fetch engagement metrics for a specific tweet (our reply).
+   * Returns { favorite_count, retweet_count, reply_count, follow_back }
+   * or null if the tweet can't be found / metrics unavailable.
+   */
+  async getTweetMetrics(tweetId) {
+    try {
+      const detail = await rpc('x.tweetDetail', { tweetId });
+      if (!detail || !detail.tweet) return null;
+      const t = detail.tweet;
+      return {
+        favorite_count: t.favoriteCount || t.favorite_count || 0,
+        retweet_count: t.retweetCount || t.retweet_count || 0,
+        reply_count: t.replyCount || t.reply_count || 0,
+        follow_back: false, // TODO: detect via user relationship endpoint
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // Lightweight liveness probe — used by /stats. Doesn't actually hit x.com
   // unless the bridge round-trips it.
   async ping() {
