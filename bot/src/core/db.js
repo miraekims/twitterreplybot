@@ -110,6 +110,34 @@ export const db = {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      -- Trend observations (PR4). Append-only ledger of every term we
+      -- saw in any HomeTimeline page the runner already pulled — zero
+      -- additional scraping, zero cost. One row per (tweet, term)
+      -- pair. The term column is normalised (lowercased; $TICKERS,
+      -- @handles, #hashtags preserved; stopwords dropped; min-length
+      -- 3 chars) so spike detection compares apples to apples.
+      --
+      -- We deliberately avoid a separate per-term aggregate table:
+      -- the rolling 6h / 24h windows are cheap to compute on demand
+      -- via GROUP BY, and the ledger lets us re-run with different
+      -- window sizes / thresholds later without throwing data away.
+      -- Volume estimate: ~40 tweets/scan × ~10 terms = ~400 rows /
+      -- 5min scan = ~115k rows/day per active campaign. Pruned
+      -- aggressively below; we keep 7 days for "compare with last
+      -- week" features later.
+      CREATE TABLE IF NOT EXISTS trend_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        term TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        tweet_id TEXT NOT NULL,
+        author_handle TEXT,
+        sample_text TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_trend_term_ts ON trend_observations(term, ts);
+      CREATE INDEX IF NOT EXISTS idx_trend_campaign_ts ON trend_observations(campaign_id, ts);
+      CREATE INDEX IF NOT EXISTS idx_trend_campaign_term_ts ON trend_observations(campaign_id, term, ts);
     `);
   },
 
@@ -351,5 +379,112 @@ export const db = {
    */
   listSettings() {
     return _db.prepare(`SELECT key, value, updated_at FROM app_settings ORDER BY key`).all();
+  },
+
+  // ---------- trend observations (PR4) ----------
+  //
+  // The runner pushes one batch per HomeTimeline page it pulls. We
+  // wrap the inserts in a transaction so 400 rows go in as a single
+  // SQLite write rather than 400 individual fsyncs (better-sqlite3's
+  // transaction wrapper does this automatically when you call the
+  // returned fn).
+  //
+  // Schema decision rationale: see CREATE TABLE comment in init().
+
+  /**
+   * Insert observations in batch. `rows` is an array of
+   *   { term, ts, tweet_id, author_handle, sample_text }
+   * Returns the number of rows actually inserted.
+   *
+   * Caller (scout/trends.js) is responsible for de-duplication
+   * within a single tweet — we don't want "eth eth eth" to count
+   * as 3 separate observations of "eth", but cross-tweet dedup is
+   * NOT done: same term in two tweets is two real observations.
+   */
+  insertTrendObservations(campaign_id, rows) {
+    if (!rows || rows.length === 0) return 0;
+    const stmt = _db.prepare(`
+      INSERT INTO trend_observations
+        (campaign_id, term, ts, tweet_id, author_handle, sample_text)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const insertMany = _db.transaction((items) => {
+      for (const r of items) {
+        stmt.run(
+          campaign_id,
+          r.term,
+          r.ts,
+          r.tweet_id,
+          r.author_handle || null,
+          r.sample_text || null,
+        );
+      }
+    });
+    insertMany(rows);
+    return rows.length;
+  },
+
+  /**
+   * Aggregate counts of every term observed in (now - sinceMs, now]
+   * for a given campaign. Returns rows of { term, count, last_ts,
+   * last_tweet_id, last_sample_text } ordered by count desc.
+   *
+   * minCount filters out long-tail noise at the SQL layer — most
+   * terms appear once or twice and aren't trends. Saves bringing
+   * 50k useless rows into Node memory.
+   */
+  trendCountsSince(campaign_id, sinceMs, minCount = 1) {
+    const cutoff = Date.now() - sinceMs;
+    return _db.prepare(`
+      SELECT term, COUNT(*) AS count,
+             MAX(ts) AS last_ts,
+             (SELECT tweet_id FROM trend_observations t2
+                WHERE t2.campaign_id = t1.campaign_id
+                  AND t2.term = t1.term
+                  AND t2.ts >= ?
+                ORDER BY t2.ts DESC LIMIT 1) AS last_tweet_id,
+             (SELECT sample_text FROM trend_observations t3
+                WHERE t3.campaign_id = t1.campaign_id
+                  AND t3.term = t1.term
+                  AND t3.ts >= ?
+                ORDER BY t3.ts DESC LIMIT 1) AS last_sample_text,
+             (SELECT author_handle FROM trend_observations t4
+                WHERE t4.campaign_id = t1.campaign_id
+                  AND t4.term = t1.term
+                  AND t4.ts >= ?
+                ORDER BY t4.ts DESC LIMIT 1) AS last_author_handle
+      FROM trend_observations t1
+      WHERE campaign_id = ? AND ts >= ?
+      GROUP BY term
+      HAVING COUNT(*) >= ?
+      ORDER BY count DESC, term ASC
+    `).all(cutoff, cutoff, cutoff, campaign_id, cutoff, minCount);
+  },
+
+  /**
+   * Same shape as trendCountsSince but for an explicit time window
+   * [fromMs, toMs). Used by spike detection to compute the baseline
+   * window (older 18h) without a separate code path.
+   */
+  trendCountsBetween(campaign_id, fromMs, toMs, minCount = 1) {
+    return _db.prepare(`
+      SELECT term, COUNT(*) AS count
+      FROM trend_observations
+      WHERE campaign_id = ? AND ts >= ? AND ts < ?
+      GROUP BY term
+      HAVING COUNT(*) >= ?
+    `).all(campaign_id, fromMs, toMs, minCount);
+  },
+
+  /**
+   * Drop observations older than `maxAgeMs`. Called from
+   * scout/trends.js on each observe() so the DB stays bounded.
+   * 7-day window is generous — rolling 24h is the only window the
+   * /trends command actually queries today.
+   */
+  pruneOldTrendObservations(maxAgeMs = 7 * 24 * 3600 * 1000) {
+    const cutoff = Date.now() - maxAgeMs;
+    const info = _db.prepare(`DELETE FROM trend_observations WHERE ts < ?`).run(cutoff);
+    return info.changes;
   },
 };

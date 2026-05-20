@@ -47,6 +47,7 @@ import { XClient } from '../x/client.js';
 import { bridge } from '../bridge/server.js';
 import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
 import { notifyOwnersDebounced, resetDebounce } from '../core/notify.js';
+import { observe as observeTrends } from '../scout/trends.js';
 
 // Per-campaign in-memory state. Rebuilt fresh on process restart — the only
 // thing we lose is "next eligible at", which means a freshly-restarted bot
@@ -367,6 +368,17 @@ async function runFeedScan(client, campaign, cfg) {
   // words appear (in any order) — this lets you say "gm crypto" without
   // it requiring those exact tokens adjacent.
   const keywords = (cfg.keywords || []).map((k) => k.trim()).filter(Boolean);
+
+  // Trend observation hook (PR4). Push the FULL feed page into the
+  // trend ledger, not just the keyword-matched subset — the whole
+  // point of /trends is to surface what's bubbling that the user
+  // hasn't put into their keyword list yet. Fire-and-forget; failures
+  // are swallowed inside trends.observe so a hiccup here can't abort
+  // a feed scan.
+  if (resp.tweets && resp.tweets.length) {
+    observeTrends(campaign.id, resp.tweets).catch(() => {});
+  }
+
   const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
   let droppedNoHandle = 0;
   let droppedNoMatch = 0;

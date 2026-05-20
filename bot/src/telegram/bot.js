@@ -30,6 +30,7 @@ import { nextSlotAt } from '../posts/scheduler.js';
 import { bridge } from '../bridge/server.js';
 import { clearSoftBan } from '../campaign/runner.js';
 import { setNotifier } from '../core/notify.js';
+import { topSpikes, TREND_DEFAULTS } from '../scout/trends.js';
 
 let bot;
 const conversations = new Map(); // chatId → { kind, step, draft }
@@ -90,6 +91,10 @@ export function startTelegram() {
   // individual fields. The /draft engine re-reads process.env on every
   // call, so changes apply without a restart.
   bot.onText(/^\/apikey(?:\s+(.+))?$/, (m, mt) => guard(m, () => cmdApiKey(m, mt[1])));
+  // /trends — show top spike terms from the trend ledger that's been
+  // accumulating from each runner feed scan. AI explains "why this
+  // matters" per term in the campaign's persona voice when key set.
+  bot.onText(/^\/trends(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdTrends(m, mt[1] && +mt[1])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
   bot.on('callback_query', (q) => handleCallback(q).catch((e) => {
     logger.warn('tg', `callback: ${e && e.message}`);
@@ -178,6 +183,10 @@ const HELP = [
   '/posts <id> — recent posts for a campaign',
   '/apikey — set/manage OpenAI/Groq/custom API key (no restart needed)',
   '',
+  'Trends:',
+  '/trends [id] — top spike terms in your home feed over the last 6h',
+  '             (with AI key: persona-voice "why this matters" per term)',
+  '',
   'Tip: type "/" in chat to get a native popup with all commands.',
 ].join('\n');
 
@@ -205,6 +214,7 @@ const COMMAND_LIST = [
   { command: 'queue', description: 'List queued/drafted posts' },
   { command: 'posts', description: 'Recent posts — /posts <id>' },
   { command: 'apikey', description: 'Set OpenAI/Groq API key' },
+  { command: 'trends', description: 'Top spike terms from your home feed (last 6h)' },
 ];
 
 async function registerCommands() {
@@ -898,10 +908,11 @@ function buildMainMenuKeyboard() {
       { text: '📝 Posts',     callback_data: 'menu:posts' },
     ],
     [
+      { text: '📈 Trends',    callback_data: 'menu:trends' },
       { text: '🔑 API key',   callback_data: 'menu:apikey' },
-      { text: '🩺 Diagnose',  callback_data: 'menu:diagnose' },
     ],
     [
+      { text: '🩺 Diagnose',  callback_data: 'menu:diagnose' },
       { text: '❓ Help',       callback_data: 'menu:help' },
     ],
   ];
@@ -963,6 +974,8 @@ async function handleMenuClick(q, section) {
       return cmdDiagnose(fakeMsg);
     case 'apikey':
       return cmdApiKey(fakeMsg);
+    case 'trends':
+      return cmdTrends(fakeMsg);
     case 'help':
       return sendEphemeral(fakeMsg, HELP);
     default:
@@ -1526,4 +1539,218 @@ function clearApiKey(chatId) {
   return bot.sendMessage(chatId,
     '🗑 Cleared OPENAI_API_KEY / OPENAI_MODEL / OPENAI_BASE_URL.\n\n' +
     'AI replies and /draft are now disabled. Use /apikey to set up again.');
+}
+
+
+
+// ============================================================
+// /trends — top spike terms from the user's home feed (PR4)
+// ============================================================
+//
+// Reads the trend_observations ledger that runner.runFeedScan
+// populates on every tick. Computes the 6h-vs-18h spike score in
+// scout/trends.topSpikes() and renders the top 5.
+//
+// When OPENAI_API_KEY is set we additionally generate a one-line
+// "why this matters" per term in the campaign's persona voice. The
+// AI block is optional — without a key the command still produces
+// the raw spike list, which is itself useful (it tells the user
+// what their feed is talking about).
+//
+// Cost note (with key): 5 terms × ~80 in-tokens + ~30 out-tokens ≈
+// $0.0001 per /trends call on gpt-4o-mini. Negligible.
+
+const TRENDS_AI_TIMEOUT_MS = 20_000;
+
+async function cmdTrends(msg, id) {
+  // Same campaign-resolution policy as /post and /draft: explicit id
+  // wins, otherwise pick the active campaign.
+  let campaignId = id;
+  if (!campaignId) {
+    campaignId = pickActiveCampaign(msg.from.id);
+    if (!campaignId) return; // pickActiveCampaign already messaged
+  } else {
+    const c = db.getCampaign(campaignId);
+    if (!c || !belongsToUser(c, msg.from.id)) {
+      return bot.sendMessage(msg.chat.id, `No such campaign #${campaignId} (or not yours).`);
+    }
+  }
+
+  const c = db.getCampaign(campaignId);
+  let cfg = {};
+  try { cfg = JSON.parse(c.config_json); } catch {}
+
+  const spikes = topSpikes(campaignId);
+  if (!spikes.length) {
+    const headline = headlineNoSpikes(campaignId);
+    return bot.sendMessage(msg.chat.id,
+      `📈 Trends — c#${campaignId} "${c.name}"\n\n` +
+      headline + '\n\n' +
+      `Window: last ${TREND_DEFAULTS.recentWindowMs / 3600_000}h ` +
+      `vs prior ${TREND_DEFAULTS.baselineWindowMs / 3600_000}h baseline.\n` +
+      `Spike threshold: ≥${TREND_DEFAULTS.minRecentCount} mentions ` +
+      `AND ≥${TREND_DEFAULTS.minSpikeRatio}× baseline rate.`);
+  }
+
+  // Send a "thinking" placeholder if we're going to call the LLM,
+  // otherwise the user sees nothing for 5-15s and starts retrying.
+  const willCallAi = !!process.env.OPENAI_API_KEY;
+  const wait = willCallAi
+    ? await bot.sendMessage(msg.chat.id, '🧠 Computing spikes + AI commentary...')
+    : null;
+
+  let commentary = {};
+  if (willCallAi) {
+    try {
+      commentary = await commentSpikes(spikes, cfg.persona);
+    } catch (e) {
+      logger.warn('trends', `commentary failed: ${e.message}`);
+      // Fall through with empty commentary; the raw spike list is
+      // still useful and we already told the user it would be quick.
+    }
+  }
+  if (wait) {
+    bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {});
+  }
+
+  const lines = [
+    `📈 Trends — c#${campaignId} "${c.name}"`,
+    `Window: last ${TREND_DEFAULTS.recentWindowMs / 3600_000}h vs prior ` +
+      `${TREND_DEFAULTS.baselineWindowMs / 3600_000}h baseline.`,
+    '',
+  ];
+  for (let i = 0; i < spikes.length; i++) {
+    const s = spikes[i];
+    const why = commentary[s.term];
+    const baselineLabel = s.baseline_count === 0 ? 'new' : `+${Math.round((s.ratio - 1) * 100)}%`;
+    const sample = (s.last_sample_text || '').replace(/\n+/g, ' ').slice(0, 140);
+    const author = s.last_author_handle ? ` (@${s.last_author_handle})` : '';
+    lines.push(`${i + 1}. ${s.term} — ${s.count}× in 6h, ${baselineLabel} vs baseline`);
+    if (why) lines.push(`   💡 ${why}`);
+    if (sample) lines.push(`   "${sample}"${author}`);
+    lines.push('');
+  }
+  if (!willCallAi) {
+    lines.push('Tip: set OPENAI_API_KEY via /apikey to add a one-line ' +
+               '"why this matters" per term in your persona voice.');
+  }
+  return bot.sendMessage(msg.chat.id, lines.join('\n'));
+}
+
+// Helper: when there are zero spikes, give a non-empty-feeling
+// status — usually means the runner hasn't accumulated enough data
+// yet (fresh campaign, just paused, or the bridge has been offline).
+function headlineNoSpikes(campaignId) {
+  const total24h = db.trendCountsSince(campaignId, 24 * 3600 * 1000, 1).length;
+  if (total24h === 0) {
+    return 'No tweets observed yet. Make sure the campaign is /run-ning ' +
+           'and the Chrome extension is connected — the trend ledger fills ' +
+           'in from each HomeTimeline scan the runner already does.';
+  }
+  if (total24h < 10) {
+    return `Only ${total24h} distinct terms observed in the last 24h — ` +
+           `not enough signal yet. Trends become useful after a few hours ` +
+           `of active runner ticks.`;
+  }
+  return `${total24h} distinct terms observed in last 24h, but no spike ` +
+         `passed the threshold (≥${TREND_DEFAULTS.minRecentCount} mentions ` +
+         `AND ≥${TREND_DEFAULTS.minSpikeRatio}× baseline). Either the feed ` +
+         `is steady today, or the campaign just started.`;
+}
+
+// Best-effort author-equality check using the campaign's account_id.
+// Avoids leaking other users' campaigns when /trends gets a stray id.
+function belongsToUser(c, ownerTg) {
+  const a = db.getAccount(c.account_id);
+  return a && a.owner_tg === ownerTg;
+}
+
+// Generate one-line "why this matters" per spike term, in persona
+// voice. Single round-trip to the LLM with a JSON-mode response so
+// we can map directly to terms — no parsing prose, no missing
+// commentary if the model rearranged the order.
+//
+// Returns an object: { term1: 'reason', term2: 'reason', ... }.
+// Throws on hard failures so the caller can fall back to no
+// commentary cleanly.
+async function commentSpikes(spikes, persona) {
+  const baseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
+  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return {};
+
+  // Build the persona block. Re-using persona.js's voice was tempting
+  // but its system prompt is reply-shaped (anchored to a quoted
+  // tweet). Trends commentary is closer to /draft's standalone-post
+  // shape: short, opinionated, no thread context.
+  const personaParts = [];
+  if (persona?.name) personaParts.push(`Your name is ${persona.name}.`);
+  if (persona?.bio) personaParts.push(`Bio: ${persona.bio}`);
+  if (persona?.style) personaParts.push(`Style: ${persona.style}`);
+  if (personaParts.length === 0) {
+    personaParts.push('Voice: matter-of-fact, lowercase, dry, no emoji, no hashtags.');
+  }
+
+  const system =
+    personaParts.join(' ') + '\n\n' +
+    'You are explaining why each trending term in a crypto-Twitter feed ' +
+    'matters RIGHT NOW (today). One sentence per term, ≤140 chars, in ' +
+    'YOUR voice. Be specific — name the concrete development, number, ' +
+    'or angle, not generic "people are talking about it". If you don\'t ' +
+    'know what the term refers to from the sample tweet, say so plainly ' +
+    'rather than inventing.\n\n' +
+    'Return JSON: {"reasons": {"term1": "one sentence", "term2": "...", ...}}.';
+
+  const userBlock = spikes.map((s, i) => {
+    const sample = (s.last_sample_text || '').replace(/\n+/g, ' ').slice(0, 200);
+    return `${i + 1}. ${s.term} — ${s.count}× in 6h, baseline ${s.baseline_count}\n` +
+           `   sample: "${sample}"`;
+  }).join('\n');
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TRENDS_AI_TIMEOUT_MS);
+  let data;
+  try {
+    const resp = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${key}`,
+        'content-type': 'application/json',
+      },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        model,
+        temperature: 0.7,
+        max_tokens: 400,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: 'Here are the trending terms:\n' + userBlock },
+        ],
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`HTTP ${resp.status}: ${body.slice(0, 200)}`);
+    }
+    data = await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
+  const raw = data?.choices?.[0]?.message?.content;
+  if (!raw) return {};
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { return {}; }
+  const reasons = parsed.reasons || parsed;
+  if (!reasons || typeof reasons !== 'object') return {};
+  // Normalise: trim, hard-cap to 200 chars, drop empty.
+  const out = {};
+  for (const [k, v] of Object.entries(reasons)) {
+    if (typeof v !== 'string') continue;
+    const trimmed = v.trim();
+    if (!trimmed) continue;
+    out[k] = trimmed.slice(0, 200);
+  }
+  return out;
 }
