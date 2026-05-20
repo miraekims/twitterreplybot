@@ -129,16 +129,22 @@ function showDashboard() {
         </div>
       </div>
 
-      <div class="stats-row">
+      <div class="hero-card">
+        <div class="label">Replies sent</div>
+        <div class="big">${c.sentTotal || 0}</div>
+        <div class="small">~${c.dailyEstimate || 0} per day capacity</div>
+      </div>
+
+      <div class="stats-row" style="margin-top:12px;">
         <div class="card">
-          <h3>Today</h3>
+          <h3>Last hour</h3>
           <div class="value">${c.sentLastHour || 0}</div>
-          <div class="sub">replies / hour</div>
+          <div class="sub">replies</div>
         </div>
         <div class="card">
-          <h3>Total</h3>
-          <div class="value">${c.sentTotal || 0}</div>
-          <div class="sub">~${c.dailyEstimate || 0} / day capacity</div>
+          <h3>Status</h3>
+          <div class="value" style="font-size:22px;">${statusText}</div>
+          <div class="sub">${c.status === 'running' ? 'campaign live' : 'tap Run to start'}</div>
         </div>
       </div>
 
@@ -181,10 +187,10 @@ function renderCampaignItem(c) {
 
 function renderNav(active) {
   const items = [
-    { id: 'home', icon: '🏠', label: 'Home' },
-    { id: 'settings', icon: '⚙️', label: 'Settings' },
-    { id: 'ai', icon: '🤖', label: 'AI' },
-    { id: 'logs', icon: '📋', label: 'Logs' },
+    { id: 'home',     icon: '🏡', label: 'Home' },
+    { id: 'settings', icon: '🎯', label: 'Tune' },
+    { id: 'ai',       icon: '✨', label: 'AI' },
+    { id: 'logs',     icon: '📊', label: 'Logs' },
   ];
   return `<nav class="nav">${items.map(i =>
     `<div class="nav-item ${i.id === active ? 'active' : ''}" onclick="navTo('${i.id}')">
