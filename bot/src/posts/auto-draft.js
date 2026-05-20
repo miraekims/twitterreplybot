@@ -39,9 +39,12 @@ import { getRecentFeedSample } from '../campaign/runner.js';
 
 // Timer config. We randomize the interval so the bot doesn't post at
 // exactly 2h intervals (which looks like a cron job to X's heuristics).
+// Peak hours bias: posts published 9-11 AM and 5-7 PM get 2-3x more
+// initial engagement (verified accounts benefit even more).
 const MIN_INTERVAL_MS = 2 * 60 * 60 * 1000;   // 2 hours minimum
 const MAX_INTERVAL_MS = 4 * 60 * 60 * 1000;   // 4 hours maximum
 const STARTUP_DELAY_MS = 5 * 60 * 1000;       // wait 5 min after boot
+const PEAK_HOURS = [9, 10, 11, 17, 18, 19];   // local hours with highest engagement
 
 let _running = false;
 let _timer = null;
@@ -114,13 +117,18 @@ async function runAutoDraftCycle() {
       return;
     }
 
-    // Check daily cap
+    // Check daily cap — use peak hours scheduling for better engagement
     cfg.__campaignId = target.id;
-    const slot = nextSlotAt(cfg);
+    let slot = nextSlotAt(cfg);
     if (slot == null) {
       logger.info('auto-draft', `skip — c${target.id} daily post cap reached`);
       return;
     }
+
+    // Peak hours optimization: if the slot falls outside peak hours,
+    // try to shift it to the nearest peak window (only if within 2h).
+    // This gives posts the best initial engagement velocity.
+    slot = optimizeForPeakHours(slot);
 
     // Generate topic from feed context
     const topic = generateTopicFromFeed();
@@ -195,4 +203,44 @@ function generateTopicFromFeed() {
   // will see the full feed context anyway — this just seeds the direction.
   // Pick the single most engaging topic or combine if they're related.
   return snippets[0]; // Simplest: use the highest-engagement tweet's text as seed
+}
+
+
+
+/**
+ * If a scheduled time falls outside peak hours, shift it to the nearest
+ * peak window — but only if the shift is ≤2h. Don't delay too much;
+ * regularity matters more than perfection.
+ *
+ * Peak hours (local): 9-11 AM, 5-7 PM — when CT is most active and
+ * the algo's 30-min engagement window has the most potential viewers.
+ */
+function optimizeForPeakHours(slotMs) {
+  const d = new Date(slotMs);
+  const hour = d.getHours();
+
+  // Already in peak? Great, no change.
+  if (PEAK_HOURS.includes(hour)) return slotMs;
+
+  // Find nearest peak hour
+  let nearestDiff = Infinity;
+  let nearestHour = hour;
+  for (const ph of PEAK_HOURS) {
+    let diff = ph - hour;
+    if (diff < 0) diff += 24;
+    if (diff < nearestDiff) {
+      nearestDiff = diff;
+      nearestHour = ph;
+    }
+  }
+
+  // Only shift if within 2 hours — don't delay posts too much
+  if (nearestDiff > 2) return slotMs;
+
+  // Shift to the peak hour + random minutes (don't all land at :00)
+  const shifted = new Date(d);
+  shifted.setHours(nearestHour, Math.floor(Math.random() * 45) + 5, 0, 0);
+  // Make sure we didn't go backwards
+  if (shifted.getTime() <= Date.now()) return slotMs;
+  return shifted.getTime();
 }
