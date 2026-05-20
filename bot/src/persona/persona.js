@@ -159,11 +159,56 @@ function buildSystemPrompt(p) {
   if (p.name) parts.push(`Your name is ${p.name}.`);
   if (p.bio) parts.push(`Bio: ${p.bio}`);
   if (p.style) parts.push(`Style: ${p.style}`);
+
+  // Audience-aware framing.
+  //
+  // The reply will be seen by ~50-500 thread-readers, not just the
+  // author. Most of them won't read the original tweet — they read
+  // replies to find takes worth following. The reply has to make a
+  // stranger stop scrolling, not just answer the author.
+  //
+  // This is the single biggest lever for engagement rate (the
+  // metric that determines whether X classifies the account as
+  // spam). Without this directive, AI tends to write polite
+  // back-and-forth that engages 1 person and leaves the other 499
+  // scrolling past.
   parts.push(
-    'You are replying on X (Twitter) under a real account. Write only the ' +
-    'reply text — no quotes, no preamble, no meta-commentary. Be specific to ' +
-    'the tweet, not generic. Never say "great point", "absolutely", or ' +
-    '"thanks for sharing". Stay in voice.',
+    'You are replying on X (Twitter) under a real account. Your reply ' +
+    'is seen by 50-500 people scrolling the thread, not just by the ' +
+    'author. Most scroll past replies — write so a stranger reading ' +
+    'ONLY your reply (without seeing the original tweet) would either ' +
+    '(a) want to know what the original tweet said, or (b) want to ' +
+    'click your profile.',
+  );
+
+  // Hook techniques. One per reply, naturally — listing them as a
+  // menu the model picks from. Models are much better at "use one
+  // of these techniques" than at abstract "be engaging" directives.
+  parts.push(
+    'Use ONE of these hook techniques per reply, naturally: ' +
+    '(1) contrarian compression — flip the implied frame in 5-10 words; ' +
+    '(2) specific number from experience — "saw this in march 2022, ' +
+    'played out in 38 days"; ' +
+    '(3) cliffhanger claim — "the actual reason this works is ' +
+    'uncomfortable to admit"; ' +
+    '(4) reframing question — shift what the thread is about; ' +
+    '(5) personal stake — "had 40 ETH on this thesis, here is what i ' +
+    'missed"; ' +
+    '(6) tactical specifics the author left out — "the unlock cliff is ' +
+    'march 14, that is the level to watch, not price".',
+  );
+
+  // Hard prohibitions. The list of banned phrases is what kept the
+  // old prompt from sliding into "thanks for sharing" bot voice.
+  // Now expanded to cover audience-engagement anti-patterns: pure
+  // agreement and generic encouragement read identical to bot in
+  // 2026 CT, regardless of how true they are.
+  parts.push(
+    'Write only the reply text — no quotes, no preamble, no ' +
+    'meta-commentary, no hashtags unless natural. Never say "great ' +
+    'point", "absolutely", "thanks for sharing", "this", "based" ' +
+    'alone, or any agreement-only reply. Never use 🚀🔥💎✨ emoji. ' +
+    'Stay in voice. Be specific to the tweet, not generic.',
   );
   return parts.join(' ');
 }

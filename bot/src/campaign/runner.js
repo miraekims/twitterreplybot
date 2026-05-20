@@ -6,32 +6,47 @@
 //   2. sleep window? → bail
 //   3. hourly cap reached? → bail
 //   4. cooldown since last action not elapsed? → bail
-//   5. queue empty + searchEverySec elapsed? → search, refill queue
+//   5. queue empty + scrollEverySec elapsed? → fetch next HomeTimeline
+//      page, filter locally by keywords, push to queue
 //   6. queue has items? → reply to next tweet, dedup-mark
 //
+// Why HomeTimeline + local filtering instead of SearchTimeline:
+//
+//   We tried SearchTimeline first (one search per keyword per cycle). X
+//   soft-banned the account inside an hour: every /graphql/.../SearchTimeline
+//   started returning HTTP 404 with empty body, even direct fetches from
+//   the user's own browser DevTools. SearchTimeline is treated as a
+//   "rare ad-hoc" endpoint by X — real users only search a handful of
+//   times per day, so anything above ~30 calls/h trips its WAF.
+//
+//   HomeTimeline is the every-scroll feed endpoint. Real users hit it
+//   constantly (every refresh, every infinite-scroll). For a well-curated
+//   account (here: 1129 follows in the crypto industry) the home feed IS
+//   already keyword-filtered by the people the user chose to follow.
+//   We pull a page (~40 tweets), filter locally for our keywords, push
+//   the matches to the reply queue. X never sees what we're "searching"
+//   for — it just sees a feed scroll, which is the most common thing on
+//   the platform.
+//
 // Throughput notes (re: 1000-replies/day target):
-//   - The supervisor wakes every 5s, so the actual-vs-configured cooldown
-//     has up to ~2.5s slop per reply. At 1000/day that's ~42min/day of
-//     unrecoverable slop, baked into the math in defaults.js.
 //   - Cooldown is rolled ONCE per reply (stored in `nextEligibleAt`), not
 //     re-rolled on every tick. Re-rolling per-tick was non-monotonic and
 //     dropped effective throughput.
-//   - When the queue is empty, we search immediately if the last search was
-//     productive. Only when consecutive searches return empty do we fall
-//     back to the configured `searchEverySec` throttle.
+//   - HomeTimeline page = ~40 tweets. Even with strict keyword filters
+//     5-10 typically match, which feeds the queue ahead of the reply
+//     pace easily.
 //
 // Bridge note: with the Chrome-bridge architecture, `account_id` no longer
 // uniquely identifies a session — the extension is global per Chrome
 // install, and the connected handle is whichever account is logged into
 // x.com in that Chrome. We still keep account_id on campaigns for now, but
-// every campaign effectively shares the same upstream session. Multi-
-// account support would need either multiple Chrome profiles or per-handle
-// routing through the bridge; explicit non-goal at v0.1.
+// every campaign effectively shares the same upstream session.
 import { db } from '../core/db.js';
 import { logger } from '../core/logger.js';
 import { XClient } from '../x/client.js';
 import { bridge } from '../bridge/server.js';
 import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
+import { notifyOwnersDebounced, resetDebounce } from '../core/notify.js';
 
 // Per-campaign in-memory state. Rebuilt fresh on process restart — the only
 // thing we lose is "next eligible at", which means a freshly-restarted bot
@@ -39,25 +54,93 @@ import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
 // in SQLite still bounds it.
 const queues = new Map();              // campaign_id → tweet[]
 const nextEligibleAt = new Map();      // campaign_id → timestamp ms
-const lastSearchEmpty = new Map();     // campaign_id → boolean (true = throttle)
+const lastScrollEmpty = new Map();     // campaign_id → boolean (true = throttle next scroll)
 const sleepLogTickedAt = new Map();    // campaign_id → timestamp ms (rate-limit sleep msgs)
 const bridgeWarnedAt = new Map();      // campaign_id → ts (last "bridge offline" warn)
-// Cursor pagination state — see runSearchPhase. We persist the bottom
-// cursor returned by SearchTimeline per (campaign, keyword) so successive
-// phases dig deeper into older results, avoiding the failure mode where
-// every search returns the same already-replied top tweets and the queue
-// stays empty forever. cursorResetAt tracks when we last cleared cursors;
-// when cfg.pacing.cursorRefreshMin elapses, we drop everything and start
-// from the top again so fresh tweets aren't missed.
-const searchCursors = new Map();       // campaign_id → Map<keyword, cursor>
-const cursorResetAt = new Map();       // campaign_id → ts of last cursor reset
+// HomeTimeline cursor for incremental scroll. When nextCursor returns null
+// (end of available feed) or a scan returns 0 fresh tweets twice in a row,
+// we reset to null and start from the top — same behavior as the X UI's
+// pull-to-refresh. We ALSO force a reset every cfg.pacing.cursorRefreshMin
+// minutes regardless of feed state, so a constantly-active feed (which
+// would never produce two empty pages in a row) still cycles back to the
+// top periodically — otherwise we'd permanently scroll into history and
+// never see fresh tweets at the top.
+const scrollCursor = new Map();        // campaign_id → opaque cursor string
+const emptyScrollStreak = new Map();   // campaign_id → count
+const cursorResetAt = new Map();       // campaign_id → ts of last forced reset
+
+// Soft-ban detector. Mostly a safety net now that we use HomeTimeline,
+// which is the most-used endpoint on x.com — getting 404s from it would
+// suggest something more serious than ad-hoc rate-limiting. We still
+// detect and back off so a misbehaving bot can't keep hitting a wall.
+const consecutive404 = new Map();
+const banUntilMs = new Map();
+const banLogTickedAt = new Map();
+
+function bumpBan(campaignId) {
+  const n = (consecutive404.get(campaignId) || 0) + 1;
+  consecutive404.set(campaignId, n);
+  if (n < 3) return null;
+  const tier = Math.min(Math.floor(n / 3) - 1, 3);
+  const minutes = 30 * (2 ** tier);
+  const until = Date.now() + minutes * 60_000;
+  banUntilMs.set(campaignId, until);
+  return minutes;
+}
+
+function clearBan(campaignId) {
+  consecutive404.delete(campaignId);
+  banUntilMs.delete(campaignId);
+  banLogTickedAt.delete(campaignId);
+}
+
+export function clearSoftBan(campaignId) {
+  clearBan(campaignId);
+}
+
+// Detect "Operation X not captured yet" errors propagated from the Chrome
+// extension via the bridge, and push a one-shot Telegram nag explaining
+// the one-time manual fix. Debounced so a stuck campaign hammering the
+// same op doesn't carpet-bomb the chat.
+//
+// Why this matters: the extension learns each X.com GraphQL op shape only
+// by observing the *real x.com tab* issuing it. HomeTimeline auto-warmup
+// covers itself (we open x.com/home in a hidden tab on bridge connect).
+// CreateTweet, however, is a write op — it only fires when a human actually
+// posts something. There's no way for us to capture it without the user
+// doing one manual tweet. Better to surface that clearly than to keep
+// throwing into a logger the user might not be tailing.
+function maybeNotifyMissingOp(campaignId, errMessage) {
+  const m = /Operation (\w+) not captured yet/.exec(errMessage || '');
+  if (!m) return;
+  const opName = m[1];
+  const key = `op-missing:${opName}`;
+  const isWriteOp = opName === 'CreateTweet';
+  const text = isWriteOp
+    ? `⚠️ Я не могу отвечать пока расширение не поймает шаблон CreateTweet.\n\n` +
+      `One-time fix: открой x.com → запости что-нибудь (любой ответ, хоть «gm») → готово.\n` +
+      `После этого я подхвачу шаблон автоматически и продолжу через ~5 секунд. ` +
+      `Делается раз в несколько недель — обычно X не меняет queryId чаще.`
+    : `⚠️ Расширение не поймало шаблон ${opName} (campaign #${campaignId}).\n\n` +
+      `Открой x.com и подёргай ленту — page-hook поймает op автоматически.`;
+  // 4 hour debounce: if the user does the manual tweet within minutes, we
+  // re-arm via resetDebounce in the success path. If they ignore the nag,
+  // we re-nag every 4h instead of every 5s.
+  notifyOwnersDebounced(key, 4 * 3600_000, text).catch(() => {});
+}
+
+// Mirrors maybeNotifyMissingOp: when a reply finally succeeds we know the
+// op was captured fine, so a *future* missing-op event should re-arm
+// immediately (instead of waiting out a stale 4h debounce). We only need
+// this for write ops we already nagged about.
+function clearMissingOpDebounce() {
+  resetDebounce('op-missing:CreateTweet');
+  resetDebounce('op-missing:HomeTimeline');
+}
 
 export async function tickCampaign(campaign) {
   const cfg = JSON.parse(campaign.config_json);
 
-  // Bridge offline? Idle silently — don't roll cooldowns, don't burn
-  // hourly bucket, don't call client. Logging is rate-limited so we don't
-  // spam every 5s when Chrome is closed.
   if (!bridge.isConnected()) {
     const last = bridgeWarnedAt.get(campaign.id) || 0;
     if (Date.now() - last > 5 * 60_000) {
@@ -67,7 +150,6 @@ export async function tickCampaign(campaign) {
     return;
   }
 
-  // Sleep window?
   const sleepRemain = inSleepWindow(cfg.sleep);
   if (sleepRemain != null) {
     const last = sleepLogTickedAt.get(campaign.id) || 0;
@@ -78,38 +160,55 @@ export async function tickCampaign(campaign) {
     return;
   }
 
-  // Hourly cap (token bucket)?
-  const sentLastHour = db.countSentLastHour(campaign.id);
-  if (sentLastHour >= (cfg.pacing.maxRepliesPerHour || 15)) {
-    return; // Will be re-checked next tick.
+  const banUntil = banUntilMs.get(campaign.id) || 0;
+  if (banUntil && Date.now() < banUntil) {
+    const last = banLogTickedAt.get(campaign.id) || 0;
+    if (Date.now() - last > 5 * 60_000) {
+      const minLeft = Math.ceil((banUntil - Date.now()) / 60_000);
+      logger.warn(
+        'runner',
+        `c${campaign.id} backoff after consecutive 404s — ${minLeft}min left. ` +
+        `If x.com works in your browser, /pause then /run to clear.`,
+        campaign.id,
+      );
+      banLogTickedAt.set(campaign.id, Date.now());
+    }
+    return;
+  } else if (banUntil) {
+    banUntilMs.delete(campaign.id);
+    banLogTickedAt.delete(campaign.id);
+    logger.info('runner', `c${campaign.id} resuming after soft-ban backoff`, campaign.id);
   }
 
-  // Cooldown since last action? Use the eligibility timestamp set after the
-  // PREVIOUS reply. If nothing scheduled, we're eligible now.
+  const sentLastHour = db.countSentLastHour(campaign.id);
+  if (sentLastHour >= (cfg.pacing.maxRepliesPerHour || 15)) {
+    return;
+  }
+
   const eligibleAt = nextEligibleAt.get(campaign.id) || 0;
   if (Date.now() < eligibleAt) return;
 
   const client = new XClient({ lang: cfg.lang || 'en' });
 
-  // Search if queue empty.
+  // Refill queue from HomeTimeline if empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
-    if (lastSearchEmpty.get(campaign.id)) {
-      const sinceSearch = Date.now() - (campaign.last_search_at || 0);
-      if (campaign.last_search_at && sinceSearch < (cfg.pacing.searchEverySec || 180) * 1000) return;
+    if (lastScrollEmpty.get(campaign.id)) {
+      const sinceScroll = Date.now() - (campaign.last_search_at || 0);
+      if (campaign.last_search_at && sinceScroll < (cfg.pacing.searchEverySec || 90) * 1000) return;
     }
     try {
-      queue = await runSearchPhase(client, campaign, cfg);
+      queue = await runFeedScan(client, campaign, cfg);
       queues.set(campaign.id, queue);
-      lastSearchEmpty.set(campaign.id, queue.length === 0);
+      lastScrollEmpty.set(campaign.id, queue.length === 0);
       db.bumpCampaignAction(campaign.id, 'search');
-      logger.info('runner', `c${campaign.id} search → ${queue.length} usable`, campaign.id);
+      logger.info('runner', `c${campaign.id} feed scan → ${queue.length} matches`, campaign.id);
+      if (queue.length > 0 && consecutive404.get(campaign.id)) {
+        clearBan(campaign.id);
+      }
     } catch (e) {
-      logger.error('runner', `c${campaign.id} search: ${e.message}`, campaign.id);
-      // BRIDGE_DISCONNECTED means Chrome went away mid-call. Don't escalate
-      // to error status — we'll just retry on the next tick when bridge is
-      // back. Auth/rate-limit codes from x.com still hard-stop the
-      // campaign so we don't spam into a wall.
+      logger.error('runner', `c${campaign.id} feed scan: ${e.message}`, campaign.id);
+      maybeNotifyMissingOp(campaign.id, e.message);
       if (e.code === 'BRIDGE_DISCONNECTED') return;
       if (e.status === 401 || e.status === 403 || e.status === 429) {
         db.setCampaignStatus(campaign.id, 'error', e.message);
@@ -119,14 +218,20 @@ export async function tickCampaign(campaign) {
     if (queue.length === 0) return;
   }
 
-  // Pop one and reply. Skip on the fly if the tweet was sent already (race
-  // between search and reply on a parallel campaign), or if the author is
-  // currently on per-author cooldown — multiple tweets from the same
-  // author may sit in the queue together, and the cooldown check at search
-  // time only excludes authors we'd already replied to BEFORE the search
-  // ran.
+  // Pop one and reply. Skip on the fly if:
+  //   - the tweet was sent already (race with a parallel campaign or a
+  //     prior tick that didn't finish),
+  //   - the author is currently on per-author cooldown (multiple tweets
+  //     from the same author may sit in the queue together — one feed
+  //     page can contain a thread or rapid successive posts),
+  //   - or no template matches the tweet's topic AND no catch-all
+  //     template was defined. We deliberately drop rather than send an
+  //     off-topic reply: a "gm fren" reply to a chart-analysis tweet is
+  //     worse than not replying. Users get topic-aware responses by
+  //     defining `tags | text` style templates.
   const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
   let t;
+  let tpl;
   while ((t = queue.shift())) {
     queues.set(campaign.id, queue);
     if (db.isSent(campaign.id, t.id)) continue;
@@ -134,25 +239,31 @@ export async function tickCampaign(campaign) {
       const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
       if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
     }
+    tpl = pickTemplate(cfg.templates, t);
+    if (!tpl) {
+      const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown>';
+      logger.info(
+        'runner',
+        `c${campaign.id} skip ${t.id} (${who}) — no template matched topic`,
+        campaign.id,
+      );
+      continue;
+    }
     break;
   }
-  if (!t) return;
-
-  const tpl = pickTemplate(cfg.templates);
+  if (!t || !tpl) return;
   let text;
   try {
     text = await rewriteTemplate({
-      template: tpl,
+      template: tpl.text,
       tweet: t,
       persona: cfg.persona,
     });
   } catch (e) {
-    text = literalSubstitute(tpl, t);
+    text = literalSubstitute(tpl.text, t);
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
 
-  // Schedule next-eligible BEFORE the network call so a hung call doesn't
-  // queue a duplicate on the next tick.
   const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
   nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
 
@@ -161,87 +272,111 @@ export async function tickCampaign(campaign) {
     db.markSent(campaign.id, t.id);
     if (t.authorHandle) db.markAuthorReplied(campaign.id, t.authorHandle);
     db.bumpCampaignAction(campaign.id, 'reply');
+    // Successful reply ⇒ CreateTweet op was captured and works. Clear any
+    // outstanding "missing op" debounce so a future regression re-nags
+    // immediately instead of waiting 4h.
+    clearMissingOpDebounce();
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
-    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})`, campaign.id);
+    const kw = t._matchedKeyword ? ` [kw="${t._matchedKeyword}"]` : '';
+    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})${kw}`, campaign.id);
   } catch (e) {
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     logger.error('runner', `c${campaign.id} reply ${t.id} (${who}): ${e.message}`, campaign.id);
+    maybeNotifyMissingOp(campaign.id, e.message);
     if (e.code === 'BRIDGE_DISCONNECTED') {
-      // Don't mark sent — extension never sent the reply. Push the tweet
-      // back to the front so the next tick (with bridge restored) tries it.
       queue.unshift(t);
       queues.set(campaign.id, queue);
       return;
     }
-    db.markSent(campaign.id, t.id); // don't retry the same broken tweet
+    db.markSent(campaign.id, t.id);
     if (e.status === 401 || e.status === 403 || e.status === 429) {
       db.setCampaignStatus(campaign.id, 'error', e.message);
     }
   }
 }
 
-async function runSearchPhase(client, campaign, cfg) {
-  // Auto-refresh cursors. Every cursorRefreshMin minutes we drop all
-  // saved cursors so the next call to SearchTimeline starts at the top of
-  // the timeline again. Without this, after enough pagination we'd be
-  // permanently stuck reading old tweets and never see fresh ones. With
-  // it, we cycle: top → deeper → deeper → ... → reset → top → ...
+// Pull one HomeTimeline page (advancing the per-campaign cursor), filter
+// locally by cfg.keywords + cfg.filters. Returns the matched tweets.
+async function runFeedScan(client, campaign, cfg) {
+  // Time-based cursor refresh. The existing 2-empty-pages logic only fires
+  // when the feed runs out of fresh tweets to show — but on an active
+  // feed we may never see two empty pages in a row, in which case the
+  // cursor would crawl ever deeper into history and we'd stop seeing
+  // recent tweets. Force a reset every cursorRefreshMin minutes so we
+  // cycle: top → deeper → ... → reset → top. Mimics how a real user
+  // periodically hits the "show new tweets" banner at the top of the
+  // feed.
   const refreshMin = cfg.pacing.cursorRefreshMin ?? 30;
-  const lastReset = cursorResetAt.get(campaign.id) || 0;
-  if (refreshMin > 0 && Date.now() - lastReset > refreshMin * 60_000) {
-    const prev = searchCursors.get(campaign.id);
-    if (prev && prev.size > 0) {
-      logger.info('runner', `c${campaign.id} cursor reset (every ${refreshMin}min) — fetching fresh top`, campaign.id);
+  const lastForced = cursorResetAt.get(campaign.id) || 0;
+  if (refreshMin > 0 && Date.now() - lastForced > refreshMin * 60_000) {
+    if (scrollCursor.has(campaign.id)) {
+      logger.info(
+        'runner',
+        `c${campaign.id} cursor refresh (every ${refreshMin}min) — fetching fresh top of feed`,
+        campaign.id,
+      );
     }
-    searchCursors.set(campaign.id, new Map());
+    scrollCursor.delete(campaign.id);
+    emptyScrollStreak.set(campaign.id, 0);
     cursorResetAt.set(campaign.id, Date.now());
   }
-  let cursors = searchCursors.get(campaign.id);
-  if (!cursors) { cursors = new Map(); searchCursors.set(campaign.id, cursors); }
 
-  const all = [];
-  const seen = new Set();
-  for (const kw of cfg.keywords) {
-    try {
-      const cursor = cursors.get(kw) || null;
-      const res = await client.searchTimeline({ query: kw, cursor });
-      const tweets = res.tweets || [];
-      const nextCursor = res.nextCursor || null;
-      for (const t of tweets) {
-        if (!seen.has(t.id)) { seen.add(t.id); all.push({ ...t, _kw: kw }); }
+  const cursor = scrollCursor.get(campaign.id) || null;
+  let resp;
+  try {
+    resp = await client.homeTimeline({ cursor, count: 40 });
+  } catch (e) {
+    if (e.code === 'BRIDGE_DISCONNECTED') throw e;
+    if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
+    if (e.status === 404) {
+      const wait = bumpBan(campaign.id);
+      if (wait != null) {
+        logger.warn(
+          'runner',
+          `c${campaign.id} soft-ban backoff: ${wait}min — HomeTimeline 404. ` +
+          `Verify x.com works in your browser before /run.`,
+          campaign.id,
+        );
       }
-      // If X returned no tweets or no continuation cursor, we hit the
-      // bottom of paginatable results. Drop our saved cursor for this
-      // keyword so the NEXT search phase starts over from the top instead
-      // of repeatedly hitting the same exhausted page.
-      if (!tweets.length || !nextCursor) {
-        cursors.delete(kw);
-      } else {
-        cursors.set(kw, nextCursor);
-      }
-    } catch (e) {
-      // Hard errors (bridge down, auth, rate limit) bubble up so the
-      // caller can break the loop and decide what to do.
-      if (e.code === 'BRIDGE_DISCONNECTED') throw e;
-      if (e.status === 401 || e.status === 403 || e.status === 429) throw e;
-      logger.warn('runner', `c${campaign.id} search "${kw}": ${e.message}`, campaign.id);
-      // Soft error — drop cursor too so we don't get stuck retrying with
-      // a bad cursor. Next phase tries fresh top.
-      cursors.delete(kw);
+      throw e;
     }
-    await sleep(800 + Math.random() * 800);
+    throw e;
   }
 
-  // Filter — track drops for diagnostics. If a non-trivial fraction of
-  // tweets is dropped solely for missing authorHandle, that's our canary
-  // for X having silently changed the user-result shape again.
-  let droppedNoHandle = 0;
-  let droppedAuthorCooldown = 0;
+  // Advance cursor for next call. If the API returned no fresh cursor or
+  // we got an empty page twice, reset to top of feed (mimics pull-to-refresh).
+  const newCursor = resp.nextCursor;
+  if (!resp.tweets || resp.tweets.length === 0) {
+    const streak = (emptyScrollStreak.get(campaign.id) || 0) + 1;
+    emptyScrollStreak.set(campaign.id, streak);
+    if (streak >= 2) {
+      scrollCursor.delete(campaign.id);
+      emptyScrollStreak.set(campaign.id, 0);
+      logger.info('runner', `c${campaign.id} feed exhausted, reset to top`, campaign.id);
+    } else if (newCursor) {
+      scrollCursor.set(campaign.id, newCursor);
+    }
+  } else {
+    emptyScrollStreak.set(campaign.id, 0);
+    if (newCursor) scrollCursor.set(campaign.id, newCursor);
+  }
+
+  // Local keyword match. cfg.keywords are now plain substrings (e.g.
+  // "solana", "gm crypto"). We treat each entry as a case-insensitive
+  // substring match against tweet text. Multi-word entries match if all
+  // words appear (in any order) — this lets you say "gm crypto" without
+  // it requiring those exact tokens adjacent.
+  const keywords = (cfg.keywords || []).map((k) => k.trim()).filter(Boolean);
   const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
+  let droppedNoHandle = 0;
+  let droppedNoMatch = 0;
+  let droppedAuthorCooldown = 0;
   const passed = [];
-  for (const t of all) {
+  for (const t of resp.tweets || []) {
     if (!t || !t.id || !t.text) continue;
     if (!t.authorHandle) { droppedNoHandle++; continue; }
+    const matched = matchKeyword(t.text, keywords);
+    if (!matched) { droppedNoMatch++; continue; }
     if (!passesFilters(t, cfg.filters)) continue;
     if (db.isSent(campaign.id, t.id)) continue;
     if (cooldownMsAuthor > 0) {
@@ -251,25 +386,37 @@ async function runSearchPhase(client, campaign, cfg) {
         continue;
       }
     }
+    t._matchedKeyword = matched;
     passed.push(t);
   }
-  if (droppedNoHandle > 0 && all.length > 0) {
-    const pct = Math.round((droppedNoHandle / all.length) * 100);
-    const fn = pct > 30 ? 'warn' : 'info';
-    logger[fn](
-      'runner',
-      `c${campaign.id} dropped ${droppedNoHandle}/${all.length} tweets with no handle (${pct}%)`,
-      campaign.id,
-    );
-  }
-  if (droppedAuthorCooldown > 0) {
+  if ((resp.tweets || []).length > 0) {
+    const cooldownPart = droppedAuthorCooldown > 0 ? `, ${droppedAuthorCooldown} author-cooldown` : '';
     logger.info(
       'runner',
-      `c${campaign.id} dropped ${droppedAuthorCooldown} tweets on per-author cooldown`,
+      `c${campaign.id} feed page: ${resp.tweets.length} tweets, ${passed.length} kw-matched, ` +
+      `${droppedNoMatch} no-match, ${droppedNoHandle} no-handle${cooldownPart}`,
       campaign.id,
     );
   }
   return passed;
+}
+
+// Match tweet text against the keyword list. Each keyword is a string;
+// multi-word entries require all words to appear in text (case-insensitive).
+// Returns the matched keyword string or null.
+function matchKeyword(text, keywords) {
+  if (!keywords || keywords.length === 0) {
+    // Empty keyword list = match everything. Useful for "reply to anything
+    // in my feed" mode.
+    return '*';
+  }
+  const lower = text.toLowerCase();
+  for (const kw of keywords) {
+    const tokens = kw.toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+    if (tokens.every((tok) => lower.includes(tok))) return kw;
+  }
+  return null;
 }
 
 function passesFilters(t, f) {
@@ -298,8 +445,71 @@ function passesFilters(t, f) {
   return true;
 }
 
-function pickTemplate(templates) {
-  return templates[Math.floor(Math.random() * templates.length)];
+// Topic-aware template selection.
+//
+// Templates can be either:
+//   • plain string  (legacy, catch-all — matches any tweet)
+//   • { match: string[], text: string }  (canonical)
+//
+// The shorthand input format the user types in /new is `tags | text`,
+// parsed by the Telegram layer into the canonical object form.
+//
+// Selection rules:
+//   1. Normalize all entries; drop malformed ones.
+//   2. Split into "matched" (at least one tag substring is present in the
+//      tweet text, all tokens of a multi-word tag must be present in any
+//      order — same semantics as cfg.keywords) and "catchall" (no tags).
+//   3. Prefer matched over catchall. Pick uniformly within the chosen pool.
+//   4. If both pools are empty → return null. The runner treats null as
+//      "skip this tweet" rather than reply off-topic.
+//
+// Why "skip" beats "reply off-topic" — a "gm fren" reply to a chart-analysis
+// post is worse than not replying. The whole point of topic tags is to keep
+// every reply on-topic; randomly picking a catch-all when none was defined
+// would defeat that.
+function pickTemplate(templates, tweet) {
+  if (!Array.isArray(templates) || templates.length === 0) return null;
+  const norm = templates.map(toCanonicalTemplate).filter(Boolean);
+  if (!norm.length) return null;
+  const lower = (tweet?.text || '').toLowerCase();
+
+  const matched = [];
+  const catchall = [];
+  for (const t of norm) {
+    if (!t.match || t.match.length === 0) {
+      catchall.push(t);
+      continue;
+    }
+    if (t.match.some((tag) => allTokensPresent(tag, lower))) matched.push(t);
+  }
+  const pool = matched.length ? matched : catchall;
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function toCanonicalTemplate(entry) {
+  if (typeof entry === 'string') {
+    const text = entry.trim();
+    return text ? { match: [], text } : null;
+  }
+  if (entry && typeof entry === 'object' && typeof entry.text === 'string' && entry.text.trim()) {
+    return {
+      match: Array.isArray(entry.match)
+        ? entry.match.map((s) => String(s).toLowerCase().trim()).filter(Boolean)
+        : [],
+      text: entry.text.trim(),
+    };
+  }
+  return null;
+}
+
+// Same semantics as runner's matchKeyword: a multi-word tag matches if all
+// of its whitespace-split tokens appear in the haystack (case-insensitive,
+// any order). Single-word tags reduce to a plain substring check.
+function allTokensPresent(tag, lowerHaystack) {
+  const tokens = String(tag).toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  return tokens.every((tok) => lowerHaystack.includes(tok));
 }
 
 // Log-normal jitter: most pauses short, occasional long ones (human-shaped).
@@ -332,4 +542,3 @@ function parseHHMM(s) {
   const m = String(s || '').match(/^(\d{1,2}):(\d{2})$/);
   return m ? (+m[1]) * 60 + (+m[2]) : null;
 }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }

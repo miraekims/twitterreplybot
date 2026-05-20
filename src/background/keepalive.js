@@ -22,9 +22,12 @@
 //    which is what we want anyway.
 //
 //    `warmupXcom` is also exported for one-shot use from bridge-client.js
-//    on connect, so a fresh bot session immediately gets HomeTimeline /
-//    UserByScreenName / etc. captured even if the user hasn't manually
-//    visited x.com since opening Chrome.
+//    on connect, so a fresh bot session immediately gets HomeTimeline
+//    captured even if the user hasn't manually visited x.com since
+//    opening Chrome. It's especially important for the autoreply runner,
+//    which now uses HomeTimeline (not SearchTimeline) — without a fresh
+//    HomeTimeline observation the very first feed scan throws "op not
+//    captured yet".
 
 import { ensureConnected } from './bridge-client.js';
 
@@ -35,8 +38,9 @@ const BRIDGE_WATCHDOG_PERIOD_MIN = 1;     // every minute
 const X_TOUCH_PERIOD_MIN = 6 * 60;         // every 6 hours
 const TOUCH_TAB_TTL_MS = 8_000;            // close the touch tab after 8s
 
-// Avoid flapping warmups on bridge reconnect storms (e.g. Wi-Fi drops). At
-// most one warmup every 5 minutes regardless of how many callers ask.
+// Avoid flapping warmups on bridge reconnect storms (e.g. Wi-Fi drops
+// triggering close/reconnect every few seconds). At most one warmup
+// every 5 minutes regardless of how many callers ask.
 const WARMUP_DEBOUNCE_MS = 5 * 60_000;
 let lastWarmupAt = 0;
 
@@ -65,7 +69,7 @@ export function registerKeepalive() {
 
 // Open a hidden x.com/home tab so the page fires its initial GraphQL
 // requests (HomeTimeline, UserByScreenName, ...). The query-registry
-// captures them and our SearchTimeline / CreateTweet calls then have
+// captures them and our HomeTimeline / CreateTweet calls then have
 // fresh queryId + headers to work with.
 //
 // Skips if:

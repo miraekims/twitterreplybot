@@ -19,10 +19,14 @@
 // you, but you've been warned.
 
 const baseFilters = () => ({
-  minLikes: 1,
-  minTweetAgeSec: 60,
-  maxAgeMinutes: 10,
-  minAuthorFollowers: 50,
+  // Note: with HomeTimeline-based feed scanning, these filters apply on
+  // top of whatever the user's follow graph already pre-selected. With a
+  // well-curated account, defaults can be much looser than they used to
+  // be when we were hitting wide-open SearchTimeline.
+  minLikes: 0,
+  minTweetAgeSec: 30,       // give X a moment to drop fake-engagement spam
+  maxAgeMinutes: 240,       // 4 hours — feed delivers fresh stuff anyway
+  minAuthorFollowers: 0,
   langs: ['en'],
   skipReplies: true,
   skipRetweets: true,
@@ -32,8 +36,13 @@ const baseFilters = () => ({
   blacklistHandles: [],
 });
 
+// Sleep is OFF by default. The user can enable it via /preset or by
+// editing config_json directly. We used to default it on (01:00-08:00)
+// "for safety", but a 24/7 schedule is fine when paced correctly and
+// matches the user's actual usage pattern (X is global; people scroll
+// at all hours).
 const baseSleep = () => ({
-  enabled: true,
+  enabled: false,
   startHHMM: '01:00',
   endHHMM: '08:00',
 });
@@ -45,7 +54,12 @@ export const PRESETS = {
     searchEverySec: 180,
     maxRepliesPerHour: 10,
     diversityCooldownSec: 1800,
+    // Per-author cooldown — never reply to the same @handle more often
+    // than every N hours, regardless of how many of their tweets match.
     authorCooldownHours: 24,
+    // Force-reset HomeTimeline scroll cursor every N minutes so a busy
+    // feed (which would otherwise never produce two consecutive empty
+    // pages) still cycles back to the top to pick up fresh tweets.
     cursorRefreshMin: 30,
   },
   medium: {
@@ -57,29 +71,24 @@ export const PRESETS = {
     authorCooldownHours: 24,
     cursorRefreshMin: 30,
   },
-  // 1000 replies/day target. Math: with sleep 01-08 we have 17 active hours
-  // and a hard hourly cap of 75 ⇒ 1275 ceiling, leaving headroom for:
-  //   (a) ~2.5s/reply supervisor-tick slop (≈ 40min/day at the target rate)
-  //   (b) jitter variance — log-normal mean with min=25,max=80 is ~50s,
-  //       which paired with the 75/h cap gives sustained ~64/h ⇒ 1088/day
-  //       on average, with the cap absorbing fast-window spikes.
-  //   (c) search misses & filtered-out tweets (the runner now refills the
-  //       queue immediately when the previous search was non-empty, so the
-  //       only real loss is a few seconds of search latency).
-  // The min/max delays are ALSO narrower than safe/medium — wider jitter on
-  // a high-volume account is a tell, not a feature; humans on Twitter don't
-  // pause 100s between replies during an active conversation but do pause
-  // 15-25s while typing.
+  // 1000 replies/day target. With sleep OFF (default now) we have all 24
+  // active hours and a hard hourly cap of 50 ⇒ 1200/day ceiling. With
+  // HomeTimeline-based scanning we don't hit SearchTimeline rate limits
+  // anymore; the bottleneck is the per-reply cooldown and account-level
+  // CreateTweet quota. min=25/max=80 gives a log-normal mean ~50s ⇒
+  // sustained ~50/h ⇒ ~1200/day under cap.
+  // searchEverySec is misnamed at this point — it's now scrollEverySec —
+  // but kept for backward-compat with existing config_json. Its actual
+  // role: throttle on consecutive empty feed scans.
   highvolume: {
     minDelaySec: 25,
     maxDelaySec: 80,
-    searchEverySec: 90,
-    maxRepliesPerHour: 75,
+    searchEverySec: 60,
+    maxRepliesPerHour: 50,
     diversityCooldownSec: 600,
     authorCooldownHours: 24,
-    // Tighter on highvolume: we're churning through search results faster,
-    // so refresh-to-top more often to avoid replying to stale 30-min-old
-    // tweets when fresh ones are arriving every minute.
+    // Tighter on highvolume: feed is consumed faster, refresh-to-top
+    // more often so we don't reply to stale tweets older than 15min.
     cursorRefreshMin: 15,
   },
 };
@@ -119,7 +128,24 @@ export function expectedDailyReplies(cfg) {
   return Math.round(cap * activeHours);
 }
 
-function parseHHMM(s) {
-  const m = String(s || '').match(/^(\d{1,2}):(\d{2})$/);
-  return m ? (+m[1]) * 60 + (+m[2]) : null;
+// Telegram /new walkthrough: keywords prompt should reflect the new
+// HomeTimeline-based scanning. Keywords are no longer X search syntax
+// (those would 404 on a different endpoint anyway); they're substrings
+// matched against tweet.text. Multi-word keywords match if all tokens
+// appear in any order.
+function stepKeywordsHelp() {
+  return (
+    'Keywords (one per line, case-insensitive substring match against ' +
+    'tweet text):\n' +
+    '  • Single word: "solana" matches any tweet containing "solana".\n' +
+    '  • Multi-word: "gm crypto" matches tweets that contain both "gm" ' +
+    'and "crypto" anywhere in the text.\n' +
+    '  • Empty list = match everything in your home feed.\n\n' +
+    'The bot scans your X home feed (the same feed you scroll) and ' +
+    'replies to tweets matching these. If your follow graph is already ' +
+    'tuned to a niche, an empty list works fine.'
+  );
 }
+
+export { stepKeywordsHelp };
+
