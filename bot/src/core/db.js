@@ -125,6 +125,9 @@ export const db = {
     return _db.prepare(`SELECT * FROM accounts WHERE id = ?`).get(id);
   },
   deleteAccount(id) { _db.prepare(`DELETE FROM accounts WHERE id = ?`).run(id); },
+  listAllAccounts() {
+    return _db.prepare(`SELECT id, owner_tg, handle, last_health_at, last_error FROM accounts`).all();
+  },
   setAccountHealth(id, ts, err = null) {
     _db.prepare(`UPDATE accounts SET last_health_at = ?, last_error = ? WHERE id = ?`).run(ts, err, id);
   },
