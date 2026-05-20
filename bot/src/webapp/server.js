@@ -15,6 +15,8 @@ import { logger } from '../core/logger.js';
 import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS } from '../campaign/defaults.js';
 import { PERSONA_PRESETS } from '../persona/presets.js';
 import { clearSoftBan } from '../campaign/runner.js';
+import { bestHoursSummary } from '../campaign/best-hours.js';
+import { getHourWeight, isGoldenHour } from '../campaign/activity-shift.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FRONTEND_PATH = path.resolve(__dirname, 'frontend');
@@ -248,6 +250,77 @@ async function handleApi(req, res, pathname, url) {
         }
       }
       return json({ ok: true });
+    }
+
+    // GET /api/campaign/:id/growth — engagement growth analytics
+    const growthMatch = pathname.match(/^\/api\/campaign\/(\d+)\/growth$/);
+    if (growthMatch && req.method === 'GET') {
+      const id = +growthMatch[1];
+      const c = db.getCampaign(id);
+      if (!c) return json({ error: 'Not found' }, 404);
+
+      const days = parseInt(url.searchParams.get('days') || '30', 10);
+      const stats = db.getGrowthStats(id, days);
+      const daily = db.getDailyGrowth(id, days);
+      const hours = bestHoursSummary(id);
+      const templateStats = db.getTemplateStats(id);
+
+      return json({
+        campaign_id: id,
+        period_days: days,
+        summary: {
+          total_replies: stats?.total_replies || 0,
+          total_likes: stats?.total_likes || 0,
+          total_retweets: stats?.total_retweets || 0,
+          total_follows: stats?.total_follows || 0,
+          avg_engagement_score: Math.round((stats?.avg_score || 0) * 100) / 100,
+          avg_quality_score: Math.round((stats?.avg_quality || 0) * 10) / 10,
+        },
+        daily,
+        best_hours: hours,
+        current_hour: {
+          utc: new Date().getUTCHours(),
+          weight: getHourWeight(id),
+          is_golden: isGoldenHour(id),
+        },
+        templates: templateStats.map((t) => ({
+          hash: t.template_hash,
+          uses: t.uses,
+          total_engagement: Math.round(t.total_engagement * 100) / 100,
+          avg_engagement: t.uses > 0 ? Math.round((t.total_engagement / t.uses) * 100) / 100 : 0,
+          disabled: !!t.disabled,
+        })),
+      });
+    }
+
+    // GET /api/campaign/:id/queue — reply queue with engagement data
+    const queueMatch = pathname.match(/^\/api\/campaign\/(\d+)\/queue$/);
+    if (queueMatch && req.method === 'GET') {
+      const id = +queueMatch[1];
+      const c = db.getCampaign(id);
+      if (!c) return json({ error: 'Not found' }, 404);
+
+      const limit = parseInt(url.searchParams.get('limit') || '50', 10);
+      const replies = db.getReplyQueue(id, limit);
+
+      return json({
+        campaign_id: id,
+        count: replies.length,
+        replies: replies.map((r) => ({
+          reply_id: r.reply_id,
+          tweet_id: r.tweet_id,
+          template_hash: r.template_hash,
+          ai_quality_score: r.ai_quality_score,
+          likes: r.likes,
+          retweets: r.retweets,
+          replies: r.replies,
+          follow_back: !!r.follow_back,
+          score: Math.round((r.score || 0) * 100) / 100,
+          sent_at: r.sent_at,
+          checked_at: r.checked_at,
+          hour_utc: r.hour_utc,
+        })),
+      });
     }
 
     return json({ error: 'Not found' }, 404);

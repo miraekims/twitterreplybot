@@ -110,6 +110,42 @@ export const db = {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      -- Reply engagement tracking for growth analytics.
+      -- Each row tracks one sent reply's engagement metrics, fetched
+      -- periodically after sending. score = weighted composite of likes,
+      -- retweets, follow_back.
+      CREATE TABLE IF NOT EXISTS reply_engagement (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        reply_id TEXT NOT NULL,
+        tweet_id TEXT NOT NULL,
+        template_hash TEXT,
+        ai_quality_score REAL,
+        likes INTEGER NOT NULL DEFAULT 0,
+        retweets INTEGER NOT NULL DEFAULT 0,
+        replies INTEGER NOT NULL DEFAULT 0,
+        follow_back INTEGER NOT NULL DEFAULT 0,
+        score REAL NOT NULL DEFAULT 0,
+        sent_at INTEGER NOT NULL,
+        checked_at INTEGER,
+        hour_utc INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_re_campaign ON reply_engagement(campaign_id, sent_at);
+      CREATE INDEX IF NOT EXISTS idx_re_template ON reply_engagement(campaign_id, template_hash);
+      CREATE INDEX IF NOT EXISTS idx_re_hour ON reply_engagement(campaign_id, hour_utc);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_re_reply ON reply_engagement(reply_id);
+
+      -- Template usage tracking for auto-prune.
+      CREATE TABLE IF NOT EXISTS template_stats (
+        campaign_id INTEGER NOT NULL,
+        template_hash TEXT NOT NULL,
+        uses INTEGER NOT NULL DEFAULT 0,
+        total_engagement REAL NOT NULL DEFAULT 0,
+        disabled INTEGER NOT NULL DEFAULT 0,
+        last_used_at INTEGER,
+        PRIMARY KEY (campaign_id, template_hash)
+      );
     `);
   },
 
@@ -355,5 +391,123 @@ export const db = {
    */
   listSettings() {
     return _db.prepare(`SELECT key, value, updated_at FROM app_settings ORDER BY key`).all();
+  },
+
+  // ---------- reply engagement ----------
+
+  insertReplyEngagement({ campaign_id, reply_id, tweet_id, template_hash, ai_quality_score, sent_at }) {
+    const hour_utc = new Date(sent_at).getUTCHours();
+    _db.prepare(`
+      INSERT OR IGNORE INTO reply_engagement
+        (campaign_id, reply_id, tweet_id, template_hash, ai_quality_score, sent_at, hour_utc)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(campaign_id, reply_id, tweet_id, template_hash || null, ai_quality_score || null, sent_at, hour_utc);
+  },
+
+  updateReplyEngagement(reply_id, { likes, retweets, replies, follow_back }) {
+    const score = (likes || 0) * 1 + (retweets || 0) * 3 + (replies || 0) * 2 + (follow_back || 0) * 5;
+    _db.prepare(`
+      UPDATE reply_engagement
+      SET likes = ?, retweets = ?, replies = ?, follow_back = ?, score = ?, checked_at = ?
+      WHERE reply_id = ?
+    `).run(likes || 0, retweets || 0, replies || 0, follow_back || 0, score, Date.now(), reply_id);
+    return score;
+  },
+
+  getUncheckedReplies(campaign_id, limit = 50) {
+    const cutoff = Date.now() - 30 * 60 * 1000; // only check replies older than 30 min
+    return _db.prepare(`
+      SELECT reply_id, tweet_id, sent_at FROM reply_engagement
+      WHERE campaign_id = ? AND (checked_at IS NULL OR checked_at < sent_at + 3600000)
+        AND sent_at < ?
+      ORDER BY sent_at ASC LIMIT ?
+    `).all(campaign_id, cutoff, limit);
+  },
+
+  getEngagementByHour(campaign_id, days = 14) {
+    const since = Date.now() - days * 86400_000;
+    return _db.prepare(`
+      SELECT hour_utc, COUNT(*) as count, AVG(score) as avg_score,
+             SUM(likes) as total_likes, SUM(retweets) as total_retweets,
+             SUM(follow_back) as total_follows
+      FROM reply_engagement
+      WHERE campaign_id = ? AND sent_at >= ?
+      GROUP BY hour_utc ORDER BY avg_score DESC
+    `).all(campaign_id, since);
+  },
+
+  getGrowthStats(campaign_id, days = 30) {
+    const since = Date.now() - days * 86400_000;
+    return _db.prepare(`
+      SELECT
+        COUNT(*) as total_replies,
+        SUM(likes) as total_likes,
+        SUM(retweets) as total_retweets,
+        SUM(follow_back) as total_follows,
+        AVG(score) as avg_score,
+        AVG(ai_quality_score) as avg_quality
+      FROM reply_engagement
+      WHERE campaign_id = ? AND sent_at >= ?
+    `).get(campaign_id, since);
+  },
+
+  getDailyGrowth(campaign_id, days = 30) {
+    const since = Date.now() - days * 86400_000;
+    return _db.prepare(`
+      SELECT
+        date(sent_at / 1000, 'unixepoch') as day,
+        COUNT(*) as replies,
+        SUM(likes) as likes,
+        SUM(retweets) as retweets,
+        SUM(follow_back) as follows,
+        AVG(score) as avg_score
+      FROM reply_engagement
+      WHERE campaign_id = ? AND sent_at >= ?
+      GROUP BY day ORDER BY day ASC
+    `).all(campaign_id, since);
+  },
+
+  // ---------- template stats ----------
+
+  bumpTemplateUse(campaign_id, template_hash) {
+    _db.prepare(`
+      INSERT INTO template_stats (campaign_id, template_hash, uses, last_used_at)
+      VALUES (?, ?, 1, ?)
+      ON CONFLICT(campaign_id, template_hash) DO UPDATE
+        SET uses = uses + 1, last_used_at = excluded.last_used_at
+    `).run(campaign_id, template_hash, Date.now());
+  },
+
+  addTemplateEngagement(campaign_id, template_hash, score) {
+    _db.prepare(`
+      UPDATE template_stats SET total_engagement = total_engagement + ?
+      WHERE campaign_id = ? AND template_hash = ?
+    `).run(score, campaign_id, template_hash);
+  },
+
+  getTemplateStats(campaign_id) {
+    return _db.prepare(`SELECT * FROM template_stats WHERE campaign_id = ?`).all(campaign_id);
+  },
+
+  getStaleTemplates(campaign_id, minUses = 20) {
+    return _db.prepare(`
+      SELECT * FROM template_stats
+      WHERE campaign_id = ? AND uses >= ? AND total_engagement = 0 AND disabled = 0
+    `).all(campaign_id, minUses);
+  },
+
+  disableTemplate(campaign_id, template_hash) {
+    _db.prepare(`UPDATE template_stats SET disabled = 1 WHERE campaign_id = ? AND template_hash = ?`)
+       .run(campaign_id, template_hash);
+  },
+
+  getReplyQueue(campaign_id, limit = 50) {
+    return _db.prepare(`
+      SELECT re.*, s.ts as queued_at
+      FROM reply_engagement re
+      LEFT JOIN sent s ON s.campaign_id = re.campaign_id AND s.tweet_id = re.tweet_id
+      WHERE re.campaign_id = ?
+      ORDER BY re.sent_at DESC LIMIT ?
+    `).all(campaign_id, limit);
   },
 };

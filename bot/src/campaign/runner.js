@@ -47,6 +47,10 @@ import { XClient } from '../x/client.js';
 import { bridge } from '../bridge/server.js';
 import { rewriteTemplate, literalSubstitute } from '../persona/persona.js';
 import { notifyOwnersDebounced, resetDebounce } from '../core/notify.js';
+import { trackReply } from './engagement.js';
+import { scoreReply, passesQualityGate } from './quality-score.js';
+import { adjustCooldown } from './activity-shift.js';
+import { isTemplateDisabled } from './auto-prune.js';
 
 // Per-campaign in-memory state. Rebuilt fresh on process restart — the only
 // thing we lose is "next eligible at", which means a freshly-restarted bot
@@ -268,6 +272,9 @@ export async function tickCampaign(campaign) {
       if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
     }
     tpl = pickTemplate(cfg.templates, t);
+    if (tpl && isTemplateDisabled(campaign.id, tpl)) {
+      tpl = null; // Pruned template — treat as no match
+    }
     if (!tpl && !process.env.OPENAI_API_KEY) {
       const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown>';
       logger.info(
@@ -311,11 +318,31 @@ export async function tickCampaign(campaign) {
     logger.warn('runner', `c${campaign.id} AI rewrite failed, using raw template: ${e.message}`, campaign.id);
   }
 
-  const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+  // AI quality scoring — score the reply before sending
+  let qualityScore = null;
+  try {
+    qualityScore = await scoreReply({
+      replyText: text,
+      tweetText: t.text,
+      tweetAuthor: t.authorHandle,
+      persona: cfg.persona,
+    });
+    if (qualityScore !== null && !passesQualityGate(qualityScore, cfg.pacing.qualityThreshold || 4)) {
+      logger.info('runner', `c${campaign.id} skip ${t.id} — quality score ${qualityScore} below threshold`, campaign.id);
+      return;
+    }
+  } catch (e) {
+    // Scoring failure is non-fatal — send anyway
+    logger.warn('runner', `c${campaign.id} quality scoring failed: ${e.message}`, campaign.id);
+  }
+
+  // Activity-shift-adjusted cooldown: shorter during golden hours, longer during dead hours
+  const baseCooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+  const cooldownMs = adjustCooldown(campaign.id, baseCooldownMs);
   nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
 
   try {
-    await client.createTweet({ text, replyToTweetId: t.id });
+    const createResult = await client.createTweet({ text, replyToTweetId: t.id });
     db.markSent(campaign.id, t.id);
     if (t.authorHandle) db.markAuthorReplied(campaign.id, t.authorHandle);
     db.bumpCampaignAction(campaign.id, 'reply');
@@ -323,9 +350,21 @@ export async function tickCampaign(campaign) {
     // outstanding "missing op" debounce so a future regression re-nags
     // immediately instead of waiting 4h.
     clearMissingOpDebounce();
+
+    // Track engagement for this reply
+    const replyId = createResult?.tweet_id || createResult?.id || `${t.id}_reply_${Date.now()}`;
+    trackReply({
+      campaign_id: campaign.id,
+      reply_id: replyId,
+      tweet_id: t.id,
+      template: tpl,
+      ai_quality_score: qualityScore,
+    });
+
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     const kw = t._matchedKeyword ? ` [kw="${t._matchedKeyword}"]` : '';
-    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})${kw}`, campaign.id);
+    const qs = qualityScore !== null ? ` [q=${qualityScore}]` : '';
+    logger.info('runner', `c${campaign.id} replied to ${who} (${t.id})${kw}${qs}`, campaign.id);
   } catch (e) {
     const who = t.authorHandle ? `@${t.authorHandle}` : '<unknown author>';
     logger.error('runner', `c${campaign.id} reply ${t.id} (${who}): ${e.message}`, campaign.id);
