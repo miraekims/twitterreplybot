@@ -25,6 +25,8 @@ import { logger } from '../core/logger.js';
 import { defaultCampaignConfig, presetPacing, expectedDailyReplies, PRESETS, stepKeywordsHelp } from '../campaign/defaults.js';
 import { aiActivationSummary } from '../persona/persona.js';
 import { PERSONA_PRESETS, getPreset, buildPersonaPresetKeyboard } from '../persona/presets.js';
+import { generateDrafts } from '../posts/draft.js';
+import { nextSlotAt } from '../posts/scheduler.js';
 import { bridge } from '../bridge/server.js';
 import { clearSoftBan } from '../campaign/runner.js';
 import { setNotifier } from '../core/notify.js';
@@ -72,6 +74,17 @@ export function startTelegram() {
   bot.onText(/^\/sleep\s+(\d+)\s+(on|off)$/, (m, mt) => guard(m, () => cmdSleep(m, +mt[1], mt[2])));
   bot.onText(/^\/diag(?:nose)?(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdDiagnose(m, mt[1] && +mt[1])));
   bot.onText(/^\/menu$/, (m) => guard(m, () => cmdMenu(m)));
+  // /post <text> — immediate-publish a top-level tweet. Bypasses /draft
+  // entirely; user types own copy. Schedules at "now" so the runner
+  // picks it up on the next tick (≤30s).
+  bot.onText(/^\/post(?:\s+([\s\S]+))?$/, (m, mt) => guard(m, () => cmdPost(m, mt[1])));
+  // /draft <topic> — generate 3 candidates from a topic seed in
+  // active campaign's persona voice. User approves one via inline button.
+  bot.onText(/^\/draft(?:\s+([\s\S]+))?$/, (m, mt) => guard(m, () => cmdDraft(m, mt[1])));
+  // /queue — list posts queued/drafted for user's campaigns.
+  bot.onText(/^\/queue$/, (m) => guard(m, () => cmdQueue(m)));
+  // /posts <id> — show recent posts for a campaign.
+  bot.onText(/^\/posts(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdPosts(m, mt[1] && +mt[1])));
   bot.on('message', (m) => guard(m, () => handleConversation(m)));
   bot.on('callback_query', (q) => handleCallback(q).catch((e) => {
     logger.warn('tg', `callback: ${e && e.message}`);
@@ -153,6 +166,12 @@ const HELP = [
   '/diagnose [id] — show bridge + captured-op health and tips',
   '/disconnect [id] — forget account row (Chrome session itself stays)',
   '',
+  'Posts (top-level tweets, not replies):',
+  '/post <text> — publish a tweet on next tick (≤30s)',
+  '/draft <topic> — AI generates 3 candidates in your persona voice',
+  '/queue — list drafts + scheduled posts',
+  '/posts <id> — recent posts for a campaign',
+  '',
   'Tip: type "/" in chat to get a native popup with all commands.',
 ].join('\n');
 
@@ -175,6 +194,10 @@ const COMMAND_LIST = [
   { command: 'diagnose', description: 'Bridge + captured-op health' },
   { command: 'disconnect', description: 'Forget account row — /disconnect [id]' },
   { command: 'help', description: 'Show full help' },
+  { command: 'post', description: 'Publish a tweet — /post <text>' },
+  { command: 'draft', description: 'AI candidates — /draft <topic>' },
+  { command: 'queue', description: 'List queued/drafted posts' },
+  { command: 'posts', description: 'Recent posts — /posts <id>' },
 ];
 
 async function registerCommands() {
@@ -723,6 +746,16 @@ async function handleCallback(q) {
       case 'menu':
         await handleMenuClick(q, idStr);
         break;
+      case 'pdraft':
+        // Auto-post draft action. callback_data shape:
+        //   pdraft:<action>:<postId>
+        // where action ∈ post|schedule|skip|regen
+        await handleDraftAction(q, idStr, arg);
+        break;
+      case 'pcancel':
+        // Cancel a queued post from /queue. callback_data: pcancel:<postId>
+        await handlePostCancel(q, idStr);
+        break;
       default:
         await bot.answerCallbackQuery(q.id, { text: `Unknown action: ${action}` });
         return;
@@ -898,19 +931,18 @@ async function handleMenuClick(q, section) {
         'planned for PR2.');
     case 'posts':
       return bot.sendMessage(q.message.chat.id,
-        '📝 Posts — auto-post engine\n\n' +
-        'Status: planned for PR4 (see bot/ROADMAP.md).\n\n' +
-        'Why it matters: ER (engagement rate) is largely a function of ' +
-        'reply-to-original ratio. Accounts that only reply trip spam-' +
-        'class detection. Posting 3-10 originals per day is the actual ' +
-        'fix.\n\n' +
-        'Coming in PR4:\n' +
-        '  • /draft — generate 3 candidate posts from current trends\n' +
-        '  • /post — manual one-shot post\n' +
-        '  • /queue — schedule, reorder, cancel\n' +
-        '  • Anti-bot pacing (irregular gaps 30min-4h, sleep-aware)\n' +
-        '  • Hit-detection: replies that get ≥5 likes auto-suggest a ' +
-        'top-level post developing the same idea');
+        '📝 Posts — auto-post engine (live)\n\n' +
+        'Commands:\n' +
+        '  /post <text> — publish a tweet immediately\n' +
+        '  /draft <topic> — AI generates 3 candidates in your voice\n' +
+        '  /queue — list queued/drafted posts\n' +
+        '  /posts <id> — last 20 posts for a campaign\n\n' +
+        'Why this matters: ER (engagement rate) is largely a function ' +
+        'of reply-to-original ratio. Accounts that only reply trip ' +
+        'spam-class detection. Posting 3-10 originals per day is the ' +
+        'actual fix.\n\n' +
+        'Pacing: posts auto-spaced 30min-4h apart, sleep window honored, ' +
+        'daily cap 6 by default.');
     case 'diagnose':
       return cmdDiagnose(fakeMsg);
     case 'help':
@@ -918,5 +950,336 @@ async function handleMenuClick(q, section) {
     default:
       return bot.sendMessage(q.message.chat.id,
         `Unknown menu section: ${section}`);
+  }
+}
+
+
+
+// ---------- /post — immediate top-level tweet ----------
+//
+// /post <text> takes the user's literal text and queues it for the
+// next runner tick (≤30s). Bypasses /draft entirely — for moments
+// when the user already has copy in mind (or wants to bypass AI).
+//
+// Why we don't publish synchronously here:
+//   The runner already has bridge-aware error handling, retry, and
+//   logging. Going through the queue means /post has identical
+//   behavior to /draft+approve, which keeps mental model simple.
+//   30s of latency is acceptable for "post when ready" UX.
+function cmdPost(msg, text) {
+  if (!text || !text.trim()) {
+    return bot.sendMessage(msg.chat.id,
+      'Usage: /post <text>\n\n' +
+      'Publishes a top-level tweet (NOT a reply) on the next runner ' +
+      'tick (≤30s). For AI-generated candidates, use /draft <topic> instead.');
+  }
+  const trimmed = text.trim();
+  if (trimmed.length > 280) {
+    return bot.sendMessage(msg.chat.id,
+      `Too long: ${trimmed.length} chars (X cap is 280). Trim and retry.`);
+  }
+  const cId = pickActiveCampaign(msg.from.id);
+  if (!cId) return; // pickActiveCampaign already messaged the user
+  const id = db.insertScheduledPost({
+    campaign_id: cId,
+    text: trimmed,
+    scheduled_at: Date.now(),
+  });
+  bot.sendMessage(msg.chat.id,
+    `📝 queued post #${id} for campaign #${cId}.\n` +
+    `Will publish on next tick (≤30s).`);
+}
+
+// ---------- /draft — AI candidates ----------
+//
+// /draft <topic> generates 3 distinct candidate posts in the active
+// campaign's persona voice, sends each as a separate message with
+// inline action buttons (Post / Regen / Skip).
+//
+// The user can interact with each independently — approve one,
+// regen another, skip the third. Each candidate is persisted as
+// a 'draft' row so callbacks can look it up by id without us
+// stuffing the entire text into callback_data (which has a 64-byte
+// limit).
+async function cmdDraft(msg, topic) {
+  if (!topic || !topic.trim()) {
+    return bot.sendMessage(msg.chat.id,
+      'Usage: /draft <topic>\n\n' +
+      'Examples:\n' +
+      '  /draft eth gas trends this week\n' +
+      '  /draft why funding rates lie about sentiment\n' +
+      '  /draft state of restaking after eigenlayer slashing\n\n' +
+      'AI generates 3 candidates in your campaign\'s persona voice. ' +
+      'You pick one to publish (or regen / skip).');
+  }
+  const cId = pickActiveCampaign(msg.from.id);
+  if (!cId) return;
+  const c = db.getCampaign(cId);
+  let cfg = {};
+  try { cfg = JSON.parse(c.config_json); } catch {}
+
+  // Acknowledge before the API call — generateDrafts can take 5-15s.
+  // Without this, the user sits staring at nothing wondering if it
+  // hung, which causes them to retry, double-billing the OpenAI call.
+  const waitMsg = await bot.sendMessage(msg.chat.id,
+    '🧠 Generating 3 candidates...');
+
+  let candidates;
+  try {
+    candidates = await generateDrafts({
+      topic: topic.trim(),
+      persona: cfg.persona,
+      count: 3,
+    });
+  } catch (e) {
+    bot.deleteMessage(msg.chat.id, waitMsg.message_id).catch(() => {});
+    return bot.sendMessage(msg.chat.id, `❌ /draft failed: ${e.message}`);
+  }
+  bot.deleteMessage(msg.chat.id, waitMsg.message_id).catch(() => {});
+
+  // Persist each candidate as a draft row, then render each in its
+  // own message. Independent rows = independent buttons = the user
+  // can act on them in any order.
+  for (let i = 0; i < candidates.length; i++) {
+    const text = candidates[i];
+    const draftId = db.insertDraft({
+      campaign_id: cId,
+      text,
+      topic: topic.trim(),
+    });
+    await bot.sendMessage(msg.chat.id,
+      `Candidate ${i + 1}/${candidates.length} — ${text.length} chars\n\n${text}`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Post now', callback_data: `pdraft:post:${draftId}` },
+            { text: '⏰ Schedule', callback_data: `pdraft:schedule:${draftId}` },
+          ], [
+            { text: '🔁 Regen', callback_data: `pdraft:regen:${draftId}` },
+            { text: '❌ Skip', callback_data: `pdraft:skip:${draftId}` },
+          ]],
+        },
+      });
+  }
+}
+
+// ---------- /queue — drafts + scheduled posts ----------
+function cmdQueue(msg) {
+  const accountIds = db.listAccounts(msg.from.id).map((a) => a.id);
+  const allCampaigns = db.listCampaigns(msg.from.id);
+  const ownedIds = allCampaigns.map((c) => c.id);
+  if (!ownedIds.length) {
+    return sendEphemeral(msg, 'No campaigns. Use /new first.');
+  }
+  const queued = db.listQueuedPosts(ownedIds);
+  if (!queued.length) {
+    return sendEphemeral(msg, 'Queue is empty. Use /post or /draft to add posts.');
+  }
+  // Each queued post gets its own message + cancel button. Easier to
+  // act on individually than a single combined list.
+  for (const p of queued) {
+    const when = p.status === 'scheduled' && p.scheduled_at
+      ? `⏰ ${new Date(p.scheduled_at).toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      : '📝 draft';
+    bot.sendMessage(msg.chat.id,
+      `${when} — c#${p.campaign_id}, post #${p.id}\n\n${p.text}`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            ...(p.status === 'draft' ? [
+              { text: '✅ Post now', callback_data: `pdraft:post:${p.id}` },
+              { text: '⏰ Schedule', callback_data: `pdraft:schedule:${p.id}` },
+            ] : []),
+            { text: '❌ Cancel', callback_data: `pcancel:${p.id}` },
+          ]],
+        },
+      });
+  }
+}
+
+// ---------- /posts — recent posts for a campaign ----------
+function cmdPosts(msg, id) {
+  if (!id) {
+    const list = db.listCampaigns(msg.from.id);
+    if (!list.length) return sendEphemeral(msg, 'No campaigns yet.');
+    if (list.length === 1) id = list[0].id;
+    else return sendEphemeral(msg,
+      'Specify which campaign:\n' + list.map((c) => `/posts ${c.id} — ${c.name}`).join('\n'));
+  }
+  const c = db.getCampaign(id);
+  if (!c) return sendEphemeral(msg, 'No such campaign.');
+  const rows = db.recentPosts(id, 20);
+  if (!rows.length) return sendEphemeral(msg, `c#${id}: no posts yet.`);
+  const lines = rows.map((p) => {
+    const ico = p.status === 'published' ? '✓'
+              : p.status === 'scheduled' ? '⏰'
+              : p.status === 'draft' ? '📝'
+              : p.status === 'failed' ? '⚠'
+              : p.status === 'cancelled' ? '✗'
+              : '?';
+    const ts = p.posted_at ? new Date(p.posted_at).toISOString().slice(0, 16).replace('T', ' ')
+             : p.scheduled_at ? new Date(p.scheduled_at).toISOString().slice(0, 16).replace('T', ' ')
+             : '';
+    return `${ico} #${p.id} ${ts} — ${p.text.slice(0, 100).replace(/\n/g, ' ')}` +
+      (p.error ? ` — ⚠ ${p.error.slice(0, 80)}` : '');
+  });
+  return sendEphemeral(msg,
+    `Recent posts for c#${id}:\n\n` + lines.join('\n'),
+    {}, /* ttl */ 5 * 60 * 1000);
+}
+
+// Find the user's active campaign for /post and /draft. With the
+// bridge model the typical user has 1-2 campaigns. We pick the
+// running one first; if none running, the most recently used; if
+// none yet, return null and tell the user.
+function pickActiveCampaign(tgUserId) {
+  const list = db.listCampaigns(tgUserId);
+  if (!list.length) {
+    bot.sendMessage(tgUserId,
+      'No campaigns yet. Use /new to create one — posts attach to a ' +
+      'campaign so they share its persona voice.');
+    return null;
+  }
+  const running = list.filter((c) => c.status === 'running');
+  if (running.length === 1) return running[0].id;
+  if (list.length === 1) return list[0].id;
+  // Multiple campaigns and no single running one — ambiguous, but for
+  // the common case of "I want to post" the user means their main
+  // campaign. We pick the most recently active by last_action_at.
+  const sorted = [...list].sort(
+    (a, b) => (b.last_action_at || 0) - (a.last_action_at || 0),
+  );
+  return sorted[0].id;
+}
+
+// ---------- pdraft callback ----------
+//
+// callback_data: pdraft:<action>:<postId>
+// action ∈ post | schedule | skip | regen
+async function handleDraftAction(q, action, postIdStr) {
+  const postId = +postIdStr;
+  const post = db.getPost(postId);
+  if (!post) {
+    return bot.sendMessage(q.message.chat.id, `Draft #${postIdStr} not found.`);
+  }
+  // Don't let users mess with already-published or cancelled posts.
+  if (post.status !== 'draft' && action !== 'skip') {
+    return bot.sendMessage(q.message.chat.id,
+      `Post #${postId} is in status "${post.status}", can't ${action}.`);
+  }
+
+  switch (action) {
+    case 'post': {
+      // Approve immediately — schedule at "now". Cancel sibling drafts
+      // generated in the same batch (same topic, same campaign, draft
+      // status). User picked one, others are noise now.
+      db.schedulePost(postId, Date.now());
+      cancelSiblingDrafts(post);
+      // Edit the original message to remove buttons + show status.
+      await editToFinal(q, post, '✅ Approved — publishing on next tick');
+      break;
+    }
+    case 'schedule': {
+      let cfg = {};
+      try { cfg = JSON.parse(db.getCampaign(post.campaign_id).config_json); } catch {}
+      cfg.__campaignId = post.campaign_id; // pass-through for nextSlotAt
+      const slot = nextSlotAt(cfg);
+      if (slot == null) {
+        return bot.sendMessage(q.message.chat.id,
+          `📅 Daily cap reached for c#${post.campaign_id}. ` +
+          `Try again tomorrow, or /post to override (no cap).`);
+      }
+      db.schedulePost(postId, slot);
+      cancelSiblingDrafts(post);
+      const when = new Date(slot).toISOString().slice(0, 16).replace('T', ' ');
+      await editToFinal(q, post, `⏰ Scheduled for ${when} UTC`);
+      break;
+    }
+    case 'skip': {
+      db.cancelPost(postId);
+      await editToFinal(q, post, '❌ Skipped');
+      break;
+    }
+    case 'regen': {
+      // Single-candidate regeneration. Generates 1 new candidate on
+      // the same topic, saves as a new draft, replaces the current
+      // message buttons with the new draft's buttons.
+      const c = db.getCampaign(post.campaign_id);
+      let cfg = {};
+      try { cfg = JSON.parse(c.config_json); } catch {}
+      let fresh;
+      try {
+        fresh = await generateDrafts({
+          topic: post.topic || '(re-roll)',
+          persona: cfg.persona,
+          count: 1,
+        });
+      } catch (e) {
+        return bot.sendMessage(q.message.chat.id, `Regen failed: ${e.message}`);
+      }
+      const newId = db.insertDraft({
+        campaign_id: post.campaign_id,
+        text: fresh[0],
+        topic: post.topic,
+      });
+      db.cancelPost(postId);
+      await bot.editMessageText(
+        `Regenerated — ${fresh[0].length} chars\n\n${fresh[0]}`,
+        {
+          chat_id: q.message.chat.id,
+          message_id: q.message.message_id,
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ Post now', callback_data: `pdraft:post:${newId}` },
+              { text: '⏰ Schedule', callback_data: `pdraft:schedule:${newId}` },
+            ], [
+              { text: '🔁 Regen', callback_data: `pdraft:regen:${newId}` },
+              { text: '❌ Skip', callback_data: `pdraft:skip:${newId}` },
+            ]],
+          },
+        },
+      ).catch(() => {});
+      break;
+    }
+    default:
+      return bot.sendMessage(q.message.chat.id, `Unknown draft action: ${action}`);
+  }
+}
+
+async function handlePostCancel(q, postIdStr) {
+  const postId = +postIdStr;
+  const post = db.getPost(postId);
+  if (!post) return bot.sendMessage(q.message.chat.id, `Post #${postIdStr} not found.`);
+  db.cancelPost(postId);
+  await editToFinal(q, post, '❌ Cancelled');
+}
+
+// Replace the current message's buttons with a status line. We keep
+// the post body visible so the user can see what they approved/skipped
+// in chat history without scrolling up.
+async function editToFinal(q, post, statusLine) {
+  await bot.editMessageText(
+    `${statusLine}\n\n${post.text}`,
+    {
+      chat_id: q.message.chat.id,
+      message_id: q.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    },
+  ).catch(() => {});
+}
+
+// When the user approves a candidate from a /draft batch, the other
+// 2 are no longer wanted. Cancel them so /queue stays clean. We
+// match by topic + campaign + status='draft' since drafts in the same
+// batch share both.
+function cancelSiblingDrafts(approvedPost) {
+  if (!approvedPost.topic) return;
+  const accountCampaigns = [approvedPost.campaign_id];
+  const queued = db.listQueuedPosts(accountCampaigns);
+  for (const p of queued) {
+    if (p.id === approvedPost.id) continue;
+    if (p.status !== 'draft') continue;
+    if (p.topic !== approvedPost.topic) continue;
+    db.cancelPost(p.id);
   }
 }

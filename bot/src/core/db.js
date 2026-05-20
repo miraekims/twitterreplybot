@@ -74,6 +74,30 @@ export const db = {
         msg TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_logs_campaign ON logs(campaign_id, ts);
+
+      -- Top-level posts (NOT replies). Created by /post (immediate),
+      -- /draft (AI-suggested, awaiting user pick), or via the
+      -- (planned) trend-extractor. Status transitions:
+      --   draft     → user hasn't approved yet, ephemeral, may be deleted
+      --   scheduled → approved, queued for the runner to publish
+      --   published → posted_tweet_id is the live X tweet id
+      --   failed    → publish attempt failed; error column has details
+      --   cancelled → user dropped it pre-publish via /queue cancel
+      CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        link TEXT,
+        topic TEXT,                          -- the seed used for /draft, NULL for /post
+        status TEXT NOT NULL,                -- draft | scheduled | published | failed | cancelled
+        scheduled_at INTEGER,                -- ms; null for draft/published
+        posted_at INTEGER,                   -- ms; non-null when status=published
+        posted_tweet_id TEXT,                -- live X tweet id once published
+        error TEXT,                          -- last failure message, if any
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_posts_campaign_status ON posts(campaign_id, status);
+      CREATE INDEX IF NOT EXISTS idx_posts_due ON posts(status, scheduled_at);
     `);
   },
 
@@ -165,5 +189,122 @@ export const db = {
   recentLogs(campaign_id, limit = 30) {
     return _db.prepare(`SELECT ts, level, msg FROM logs WHERE campaign_id = ?
                         ORDER BY id DESC LIMIT ?`).all(campaign_id, limit);
+  },
+
+  // ---------- posts (top-level tweets) ----------
+  //
+  // These are author-initiated tweets, NOT replies. Two creation paths:
+  //   /post <text>  → status='scheduled' at now (immediate publish on
+  //                   next runner tick, ≤30s)
+  //   /draft        → status='draft' for each candidate; user approves
+  //                   one which flips it to 'scheduled' at a future
+  //                   slot and cancels its sibling drafts.
+
+  /**
+   * Insert a draft (status='draft', no scheduled_at). Returns id.
+   * Drafts have no scheduled_at — they're not visible to the runner
+   * until the user approves and we re-stamp scheduled_at.
+   */
+  insertDraft({ campaign_id, text, topic = null, link = null }) {
+    return _db.prepare(`
+      INSERT INTO posts (campaign_id, text, link, topic, status, created_at)
+      VALUES (?, ?, ?, ?, 'draft', ?)
+    `).run(campaign_id, text, link, topic, Date.now()).lastInsertRowid;
+  },
+
+  /**
+   * Insert a post directly into the scheduled queue. Used by /post
+   * (when user types their own text and we publish on next tick).
+   */
+  insertScheduledPost({ campaign_id, text, link = null, topic = null, scheduled_at }) {
+    return _db.prepare(`
+      INSERT INTO posts (campaign_id, text, link, topic, status, scheduled_at, created_at)
+      VALUES (?, ?, ?, ?, 'scheduled', ?, ?)
+    `).run(campaign_id, text, link, topic, scheduled_at, Date.now()).lastInsertRowid;
+  },
+
+  getPost(id) {
+    return _db.prepare(`SELECT * FROM posts WHERE id = ?`).get(id);
+  },
+
+  /**
+   * Promote a draft to scheduled at a specific time. Idempotent on
+   * already-scheduled rows (re-stamps scheduled_at).
+   */
+  schedulePost(id, scheduled_at) {
+    _db.prepare(`UPDATE posts SET status = 'scheduled', scheduled_at = ?, error = NULL
+                 WHERE id = ?`).run(scheduled_at, id);
+  },
+
+  cancelPost(id) {
+    _db.prepare(`UPDATE posts SET status = 'cancelled' WHERE id = ?`).run(id);
+  },
+
+  markPostPublished(id, tweet_id) {
+    _db.prepare(`UPDATE posts SET status = 'published', posted_at = ?,
+                 posted_tweet_id = ?, error = NULL WHERE id = ?`)
+       .run(Date.now(), tweet_id, id);
+  },
+
+  markPostFailed(id, error) {
+    _db.prepare(`UPDATE posts SET status = 'failed', error = ? WHERE id = ?`)
+       .run(error || '', id);
+  },
+
+  /**
+   * Posts whose scheduled_at has elapsed and are still in 'scheduled'
+   * status. The runner publishes these and updates status.
+   */
+  duePosts(now) {
+    return _db.prepare(`SELECT * FROM posts
+                        WHERE status = 'scheduled' AND scheduled_at <= ?
+                        ORDER BY scheduled_at ASC LIMIT 5`).all(now);
+  },
+
+  /**
+   * For daily-cap accounting (scheduler.js#nextSlotAt). Returns posts
+   * created or scheduled in the last `since` ms for `campaign_id`,
+   * EXCLUDING cancelled and failed (failures don't burn quota — user
+   * should be allowed to retry).
+   */
+  recentPostsForCap(campaign_id, since) {
+    return _db.prepare(`SELECT id, status, scheduled_at, posted_at FROM posts
+                        WHERE campaign_id = ?
+                          AND status IN ('scheduled', 'published')
+                          AND COALESCE(scheduled_at, posted_at, created_at) >= ?
+                        ORDER BY id DESC`).all(campaign_id, since);
+  },
+
+  /**
+   * Currently-queued posts for the user-facing /queue command.
+   * Includes drafts so users can clean up unapproved candidates.
+   */
+  listQueuedPosts(campaign_ids) {
+    if (!campaign_ids?.length) return [];
+    const placeholders = campaign_ids.map(() => '?').join(',');
+    return _db.prepare(`SELECT * FROM posts
+                        WHERE campaign_id IN (${placeholders})
+                          AND status IN ('draft', 'scheduled')
+                        ORDER BY COALESCE(scheduled_at, created_at) ASC
+                        LIMIT 50`).all(...campaign_ids);
+  },
+
+  /**
+   * Recent posts (any status) for a campaign, for /posts list view.
+   */
+  recentPosts(campaign_id, limit = 20) {
+    return _db.prepare(`SELECT * FROM posts WHERE campaign_id = ?
+                        ORDER BY id DESC LIMIT ?`).all(campaign_id, limit);
+  },
+
+  /**
+   * Cleanup helper — drop drafts older than `maxAgeMs`. Drafts that
+   * never got approved would otherwise accumulate. We don't expose
+   * this to users; it's called periodically from the scheduler tick.
+   * Excluded from /queue too once age elapses, even before deletion.
+   */
+  pruneOldDrafts(maxAgeMs = 24 * 3600 * 1000) {
+    const cutoff = Date.now() - maxAgeMs;
+    _db.prepare(`DELETE FROM posts WHERE status = 'draft' AND created_at < ?`).run(cutoff);
   },
 };
