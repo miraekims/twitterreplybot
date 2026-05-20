@@ -18,6 +18,7 @@ import { startSupervisor } from './core/supervisor.js';
 import { logger } from './core/logger.js';
 import { aiActivationSummary } from './persona/persona.js';
 import { startBridgeServer, bridge } from './bridge/server.js';
+import { startPostsRunner } from './posts/scheduler.js';
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -54,6 +55,7 @@ async function main() {
   bridge.onDisconnect((s) => logger.warn('boot', `bridge: ✗ extension disconnected (was @${s.handle || '?'})`));
 
   startSupervisor();
+  startPostsRunner();
   startTelegram();
 
   process.on('SIGINT', () => {
