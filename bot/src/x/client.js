@@ -39,6 +39,10 @@ export class XClient {
     return rpc('x.homeTimeline', { cursor, count });
   }
 
+  async tweetDetail({ tweetId }) {
+    return rpc('x.tweetDetail', { tweetId });
+  }
+
   async createTweet({ text, replyToTweetId }) {
     return rpc('x.createTweet', { text, replyToTweetId });
   }

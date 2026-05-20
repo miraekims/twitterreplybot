@@ -620,6 +620,8 @@ const KNOWN_OPS = [
   { name: 'CreateTweet', required: true,
     fix: 'post any tweet manually on x.com — even just "gm" — once. ' +
          'Captured shape persists across Chrome restarts.' },
+  { name: 'TweetDetail', required: true,
+    fix: 'click on any tweet to open it (view its replies). Once is enough.' },
   { name: 'UserByScreenName', required: false,
     fix: 'visit any user profile on x.com once' },
 ];
