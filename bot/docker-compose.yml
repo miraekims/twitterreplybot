@@ -18,6 +18,11 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+      # Mount frontend as live volume — `git pull` is enough, no rebuild needed.
+      # The webapp server reads HTML/CSS/JS from disk on every request, so
+      # changes appear instantly. Remove `:ro` if you ever edit files inside
+      # the container (you shouldn't — edit them on the host and commit).
+      - ./src/webapp/frontend:/app/src/webapp/frontend:ro
     ports:
       - "127.0.0.1:8787:8787"
       - "127.0.0.1:8788:8788"
