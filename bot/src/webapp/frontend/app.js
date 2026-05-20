@@ -188,6 +188,7 @@ function renderCampaignItem(c) {
 function renderNav(active) {
   const items = [
     { id: 'home',     icon: '🏡', label: 'Home' },
+    { id: 'premium',  icon: '⭐', label: 'Premium' },
     { id: 'settings', icon: '🎯', label: 'Tune' },
     { id: 'ai',       icon: '✨', label: 'AI' },
     { id: 'logs',     icon: '📊', label: 'Logs' },
@@ -203,6 +204,7 @@ function renderNav(active) {
 // ---------- Navigation ----------
 async function navTo(tab) {
   if (tab === 'home') return showDashboard();
+  if (tab === 'premium') return showPremium();
   if (tab === 'settings') return showSettings();
   if (tab === 'ai') return showAiSettings();
   if (tab === 'logs') return showLogs();
