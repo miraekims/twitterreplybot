@@ -19,6 +19,7 @@ import { logger } from './core/logger.js';
 import { aiActivationSummary } from './persona/persona.js';
 import { startBridgeServer, bridge } from './bridge/server.js';
 import { startPostsRunner } from './posts/scheduler.js';
+import { startAutoDraft } from './posts/auto-draft.js';
 
 function requireEnv(name) {
   const v = process.env[name];
@@ -72,6 +73,7 @@ async function main() {
 
   startSupervisor();
   startPostsRunner();
+  startAutoDraft();
   startTelegram();
 
   process.on('SIGINT', () => {

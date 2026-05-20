@@ -140,6 +140,7 @@ export const db = {
       WHERE a.owner_tg = ?`).all(owner_tg);
   },
   getCampaign(id) { return _db.prepare(`SELECT * FROM campaigns WHERE id = ?`).get(id); },
+  listAllCampaigns() { return _db.prepare(`SELECT * FROM campaigns`).all(); },
   setCampaignStatus(id, status, err = null) {
     _db.prepare(`UPDATE campaigns SET status = ?, last_error = ? WHERE id = ?`).run(status, err, id);
   },
