@@ -119,8 +119,8 @@ async function tick() {
           continue;
         }
 
-        // Skip very short comments (emoji, "gm", etc)
-        if (reply.text.length < 10) {
+        // Skip very short comments (emoji-only)
+        if (reply.text.length < 5) {
           repliedComments.add(key);
           continue;
         }

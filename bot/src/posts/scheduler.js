@@ -151,7 +151,12 @@ async function tick() {
   for (const p of due) {
     try {
       const res = await client.createTweet({ text: p.text });
-      const tweetId = res?.tweetId || res?.id || null;
+      // X's CreateTweet response nests the ID deep in the response.
+      // Try multiple paths to find it robustly.
+      const tweetId = res?.data?.create_tweet?.tweet_results?.result?.rest_id
+        || res?.tweetId || res?.id
+        || extractTweetIdFromResponse(res)
+        || null;
       db.markPostPublished(p.id, tweetId);
       logger.info('posts', `c${p.campaign_id} post ${p.id} → published as ${tweetId || '?'}`);
       // Surface to the user — they specifically asked for posts and
@@ -169,4 +174,22 @@ async function tick() {
       // retry via /post or by re-running /draft.
     }
   }
+}
+
+
+
+// Walk the CreateTweet response to find rest_id. X nests it differently
+// depending on the version of the frontend that captured the op shape.
+function extractTweetIdFromResponse(res) {
+  if (!res || typeof res !== 'object') return null;
+  const stack = [res];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') continue;
+    if (Array.isArray(node)) { for (const c of node) stack.push(c); continue; }
+    // The published tweet's rest_id is the one we want
+    if (node.rest_id && node.legacy?.full_text) return node.rest_id;
+    for (const k of Object.keys(node)) stack.push(node[k]);
+  }
+  return null;
 }

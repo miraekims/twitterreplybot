@@ -190,17 +190,21 @@ export async function tickCampaign(campaign) {
 
   const client = new XClient({ lang: cfg.lang || 'en' });
 
+  // ---- Commenter-first strategy ----
+  // Try commenter-reply ALWAYS first (even if feed queue has items).
+  // Commenter replies are higher-value: they target engaged users under
+  // whale posts, avoid spam flags, and reach people with capital.
+  // Only fall through to feed-reply if commenter queue is empty.
+  const didCommenterReply = await tickCommenterReply(campaign, cfg, client);
+  if (didCommenterReply) {
+    const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
+    nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
+    return;
+  }
+
   // Refill queue from HomeTimeline if empty.
   let queue = queues.get(campaign.id) || [];
   if (queue.length === 0) {
-    // Try commenter-reply mode first (higher engagement value)
-    const didCommenterReply = await tickCommenterReply(campaign, cfg, client);
-    if (didCommenterReply) {
-      const cooldownMs = jitterMs(cfg.pacing.minDelaySec, cfg.pacing.maxDelaySec);
-      nextEligibleAt.set(campaign.id, Date.now() + cooldownMs);
-      return;
-    }
-
     if (lastScrollEmpty.get(campaign.id)) {
       const sinceScroll = Date.now() - (campaign.last_search_at || 0);
       if (campaign.last_search_at && sinceScroll < (cfg.pacing.searchEverySec || 90) * 1000) return;
@@ -411,6 +415,10 @@ async function runFeedScan(client, campaign, cfg) {
     const matched = matchKeyword(t.text, keywords);
     if (!matched) { droppedNoMatch++; continue; }
     if (!passesFilters(t, cfg.filters)) continue;
+    // Skip direct replies to whale accounts (50k+ followers) — these
+    // trigger spam detection. We reply to their COMMENTERS instead via
+    // commenter-scan mode. Only skip if commenter mode is enabled.
+    if (cfg.replyToCommenters !== false && (t.authorFollowers || 0) >= 50000) continue;
     if (db.isSent(campaign.id, t.id)) continue;
     if (cooldownMsAuthor > 0) {
       const lastTs = db.lastAuthorReplyTs(campaign.id, t.authorHandle);
@@ -632,10 +640,10 @@ export function getRecentFeedSample(limit = 20) {
 
 const commenterQueues = new Map();        // campaign_id → commenter-tweet[]
 const lastCommenterScan = new Map();      // campaign_id → timestamp
-const COMMENTER_SCAN_INTERVAL_MS = 5 * 60_000; // scan whale posts every 5 min
-const MIN_WHALE_FOLLOWERS = 10000;        // target posts from accounts with 10k+
-const MIN_POST_REPLIES = 5;               // only drill into posts that have replies
-const MAX_COMMENTERS_PER_POST = 5;        // don't reply to more than 5 per thread
+const COMMENTER_SCAN_INTERVAL_MS = 3 * 60_000; // scan whale posts every 3 min
+const MIN_WHALE_FOLLOWERS = 5000;         // target posts from accounts with 5k+
+const MIN_POST_REPLIES = 3;               // only drill into posts that have replies
+const MAX_COMMENTERS_PER_POST = 8;        // reply to up to 8 per thread
 
 /**
  * Scan HomeTimeline for whale posts, fetch their comments, and queue
@@ -695,10 +703,8 @@ async function runCommenterScan(client, campaign, cfg) {
           const lastTs = db.lastAuthorReplyTs(campaign.id, reply.authorHandle);
           if (lastTs && Date.now() - lastTs < cooldownMsAuthor) continue;
         }
-        // Skip very short / low-effort comments (likely bots)
-        if (reply.text.length < 15) continue;
-        // Skip comments with 0 likes if the post has many replies (quality filter)
-        if ((reply.favoriteCount || 0) === 0 && replies.length > 20) continue;
+        // Skip very short / low-effort comments (likely emoji-only bots)
+        if (reply.text.length < 5) continue;
 
         allCommenters.push({
           ...reply,
