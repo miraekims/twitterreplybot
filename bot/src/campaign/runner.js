@@ -368,6 +368,12 @@ async function runFeedScan(client, campaign, cfg) {
   // it requiring those exact tokens adjacent.
   const keywords = (cfg.keywords || []).map((k) => k.trim()).filter(Boolean);
   const cooldownMsAuthor = (cfg.pacing.authorCooldownHours ?? 24) * 3600_000;
+
+  // Push ALL raw tweets to the feed snapshot for /draft topic seeding —
+  // regardless of keyword match. This gives /draft a broad view of what's
+  // trending in the user's timeline.
+  pushFeedSnapshot(resp.tweets || []);
+
   let droppedNoHandle = 0;
   let droppedNoMatch = 0;
   let droppedAuthorCooldown = 0;
@@ -541,4 +547,39 @@ function inSleepWindow(s) {
 function parseHHMM(s) {
   const m = String(s || '').match(/^(\d{1,2}):(\d{2})$/);
   return m ? (+m[1]) * 60 + (+m[2]) : null;
+}
+
+// ---- Feed snapshot for /draft topic seeding ----
+//
+// We keep the last N tweets seen across all feed scans (any campaign).
+// /draft can sample these to understand what's trending in the user's
+// timeline and produce topically relevant posts. Ring buffer, capped at
+// 100 entries — enough for a representative snapshot without memory bloat.
+const FEED_SNAPSHOT_CAP = 100;
+const feedSnapshot = [];
+
+// Called from runFeedScan after filtering — pushes ALL raw tweets from the
+// feed page (not just keyword-matched), so the topic surface is broad.
+function pushFeedSnapshot(tweets) {
+  for (const t of tweets) {
+    if (!t || !t.text) continue;
+    feedSnapshot.push({
+      text: t.text.slice(0, 300),
+      authorHandle: t.authorHandle || '',
+      favoriteCount: t.favoriteCount || 0,
+      createdAt: t.createdAt || null,
+    });
+  }
+  // Trim to cap — keep newest.
+  while (feedSnapshot.length > FEED_SNAPSHOT_CAP) feedSnapshot.shift();
+}
+
+/**
+ * Get a sample of recent feed tweets for topic seeding.
+ * Returns up to `limit` tweets sorted by engagement (likes desc).
+ */
+export function getRecentFeedSample(limit = 20) {
+  return [...feedSnapshot]
+    .sort((a, b) => (b.favoriteCount || 0) - (a.favoriteCount || 0))
+    .slice(0, limit);
 }

@@ -1,29 +1,28 @@
 // Auto-post drafting — generates 3 candidate top-level tweets from a
 // topic seed, in the campaign's persona voice.
 //
-// Why this module exists separately from persona.js:
-//   persona.js is reply-shaped — it expects an "original tweet by @author"
-//   in the user prompt and writes a reply to it. Top-level posts have a
-//   different structure: there is no quoted tweet to anchor to, the
-//   model needs to invent a viewpoint, not react. Same persona /
-//   examples drive voice fidelity, but the system prompt has to teach
-//   the model "you're posting, not replying" — otherwise replies that
-//   reference an absent tweet leak into the output ("agreed, that's why
-//   I think...").
+// v2 changes:
+//   - Posts target 200-280 chars (full X limit) instead of the previous
+//     ~115-char snippets. Longer posts get more engagement — the algo
+//     rewards dwell time and replies, both of which correlate with
+//     substantive content.
+//   - Feed-aware: when the runner has been scanning HomeTimeline, we
+//     sample recent high-engagement tweets and inject them as context.
+//     The model sees what's trending in the user's niche and writes
+//     posts that participate in the current conversation — not generic
+//     takes disconnected from the timeline.
+//   - The prompt structure now explicitly asks for 2-4 sentence posts
+//     with a hook + substance + optional CTA pattern.
 //
-// Why drafts (plural) and not one shot:
-//   The whole point of /draft is the user picks. AI-generated content
-//   is hit-or-miss; 3 candidates lets the user keep the one that lands
-//   without re-running the API call (which costs tokens AND latency).
-//   We deduplicate aggressively because the model often produces near-
-//   identical wording on consecutive calls at high temperature.
-//
-// Cost note: gpt-4o-mini at 3 candidates ≈ $0.0006 per /draft. Cheap.
+// Cost note: gpt-4o-mini at 3 candidates, ~150 tokens each ≈ $0.001 per
+// /draft. Still cheap.
 
 import { logger } from '../core/logger.js';
+import { getRecentFeedSample } from '../campaign/runner.js';
 
-const REQUEST_TIMEOUT_MS = 25_000; // 3x the per-reply budget — 3 candidates
+const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_POST_CHARS = 280;
+const TARGET_MIN_CHARS = 200;
 
 function readConfig() {
   return {
@@ -40,20 +39,16 @@ function readConfig() {
  * @param {string} args.topic   Free-form topic seed (e.g. "ETH ETF flows").
  * @param {object} [args.persona]  Same shape as persona.js expects.
  * @param {number} [args.count=3]  How many candidates to return.
- * @param {string} [args.link]  Optional URL to surface naturally (etherscan,
- *                              debank, etc). Model is told it's optional.
+ * @param {string} [args.link]  Optional URL to surface naturally.
  * @returns {Promise<string[]>}    Up to `count` plain-text candidates,
- *                                 deduped, capped at 280 chars each.
- *
- * Throws if OPENAI_API_KEY is unset — drafting without AI doesn't
- * produce anything useful and the user should know up-front.
+ *                                 deduped, 200-280 chars each.
  */
 export async function generateDrafts({ topic, persona, count = 3, link = '' }) {
   const cfg = readConfig();
   if (!cfg.key) {
     throw new Error(
-      'OPENAI_API_KEY not set. Auto-drafts need an LLM to be useful — ' +
-      'set the env var or skip /draft and use /post <text> with your own copy.',
+      'OPENAI_API_KEY not set. Auto-drafts need an LLM — ' +
+      'set via /apikey or use /post <text> with your own copy.',
     );
   }
   if (!topic || !topic.trim()) {
@@ -61,12 +56,28 @@ export async function generateDrafts({ topic, persona, count = 3, link = '' }) {
   }
 
   const system = buildPostSystemPrompt(persona);
-  const examples = (persona?.examples || []).slice(0, 8); // top-8 for posts; reply structure matters less here
+
+  // Feed context: sample recent high-engagement tweets from the user's
+  // timeline. This grounds the model in what's actually being discussed
+  // RIGHT NOW — produces posts that participate in ongoing conversations
+  // rather than generic filler.
+  const feedSample = getRecentFeedSample(15);
+  const feedContext = feedSample.length > 0
+    ? '\n\n--- CURRENT FEED CONTEXT (what people in your niche are posting right now) ---\n' +
+      feedSample.map((t, i) =>
+        `${i + 1}. @${t.authorHandle}: "${t.text.slice(0, 200)}" (${t.favoriteCount} likes)`
+      ).join('\n') +
+      '\n--- END FEED CONTEXT ---\n\n' +
+      'Use the feed context to understand what topics are hot RIGHT NOW. ' +
+      'Your post should feel like a natural addition to this conversation — ' +
+      'react to trends, add your angle, or build on what others are discussing. ' +
+      'Do NOT quote or directly reply to any specific tweet above.'
+    : '';
+
+  const examples = (persona?.examples || []).slice(0, 8);
   const examplesBlock = examples.length
-    ? '\n\nVoice samples (these are reply-shaped but the tone is the ' +
-      'same):\n' + examples.map((ex, i) =>
-        `${i + 1}. ${ex.reply}`,
-      ).join('\n')
+    ? '\n\nVoice samples (reply-shaped but the tone is the same):\n' +
+      examples.map((ex, i) => `${i + 1}. ${ex.reply}`).join('\n')
     : '';
 
   const linkClause = link
@@ -75,16 +86,22 @@ export async function generateDrafts({ topic, persona, count = 3, link = '' }) {
     : '';
 
   const userPrompt =
-    `Topic: ${topic.trim()}\n\n` +
-    `Write ${count} different candidate posts (top-level tweets, NOT replies) ` +
+    `Topic: ${topic.trim()}\n` +
+    feedContext +
+    `\nWrite ${count} different candidate posts (top-level tweets, NOT replies) ` +
     `on this topic in my voice.${linkClause}\n\n` +
-    `Constraints:\n` +
-    `- Each ≤240 chars (X cap is 280, leave headroom)\n` +
-    `- Each must take a SPECIFIC angle or claim — no generic "interesting times" filler\n` +
+    `CRITICAL length requirement:\n` +
+    `- Each post MUST be ${TARGET_MIN_CHARS}-${MAX_POST_CHARS} characters (this is mandatory)\n` +
+    `- Aim for 240-270 chars — use the FULL space X gives you\n` +
+    `- Posts under 200 chars will be rejected — add more substance\n` +
+    `- Structure: hook sentence + supporting detail/data/reasoning + optional question or CTA\n\n` +
+    `Content requirements:\n` +
+    `- Each must take a SPECIFIC angle or claim grounded in current discussion\n` +
+    `- Reference real protocols, metrics, events, or mechanisms — not vague generalities\n` +
     `- No two candidates restate the same thesis with different words\n` +
-    `- Don't open with "I think" / "tbh" / "honestly"\n` +
-    `- Output as a JSON array of strings, no preamble. ` +
-    `Example: ["post 1", "post 2", "post 3"]`;
+    `- Make it feel like you JUST saw something in your feed that triggered this thought\n` +
+    `- Don't open with "I think" / "tbh" / "honestly" / "hot take:"\n\n` +
+    `Output as JSON: {"posts": ["post 1", "post 2", "post 3"]}`;
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
@@ -98,14 +115,9 @@ export async function generateDrafts({ topic, persona, count = 3, link = '' }) {
       signal: ctrl.signal,
       body: JSON.stringify({
         model: cfg.model,
-        // Higher than reply-time temperature: candidates should diverge
-        // from each other. We dedupe afterwards anyway.
         temperature: 1.0,
-        // 3 candidates × ~80 tokens = 240, plus JSON overhead → 320 is
-        // safe headroom without paying for runaway output.
-        max_tokens: 400,
-        // Force JSON mode — cheaper than parsing prose, and the model
-        // is unambiguous about the shape we want.
+        // 3 candidates × ~100 tokens (280 chars) = ~300 + JSON overhead → 600
+        max_tokens: 700,
         response_format: { type: 'json_object' },
         messages: [
           {
@@ -140,11 +152,7 @@ export async function generateDrafts({ topic, persona, count = 3, link = '' }) {
 
 /**
  * Parse the JSON-mode response and clean up each candidate.
- *
- * Rejects empties, dedupes identical or near-identical strings (case-
- * insensitive prefix collisions), and hard-trims to 280 chars. Returns
- * up to `max` candidates. Throws if zero survive cleanup — better to
- * fail loudly than show the user blank buttons.
+ * Rejects empties, enforces min length, dedupes, trims to 280 chars.
  */
 function parseCandidates(raw, max) {
   let parsed;
@@ -153,8 +161,6 @@ function parseCandidates(raw, max) {
 
   let arr = Array.isArray(parsed) ? parsed : parsed?.posts;
   if (!Array.isArray(arr)) {
-    // Sometimes the model puts the array under a different key; grab
-    // the first array-valued field.
     const firstArray = Object.values(parsed || {}).find(Array.isArray);
     arr = firstArray;
   }
@@ -168,10 +174,14 @@ function parseCandidates(raw, max) {
     if (typeof item !== 'string') continue;
     const cleaned = item
       .trim()
-      .replace(/^["'`]+|["'`]+$/g, '') // strip stray surrounding quotes
+      .replace(/^["'`]+|["'`]+$/g, '')
       .slice(0, MAX_POST_CHARS);
     if (!cleaned) continue;
-    // Cheap near-dup detection — first 60 chars lowercased.
+    // Skip posts that are too short — the whole point is substantive content
+    if (cleaned.length < TARGET_MIN_CHARS * 0.7) {
+      logger.info('draft', `rejected candidate (${cleaned.length} chars, min ${TARGET_MIN_CHARS}): ${cleaned.slice(0, 60)}...`);
+      continue;
+    }
     const key = cleaned.slice(0, 60).toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -179,23 +189,19 @@ function parseCandidates(raw, max) {
     if (out.length >= max) break;
   }
   if (out.length === 0) {
-    throw new Error('AI candidates were all empty or duplicated after cleanup');
+    throw new Error('AI candidates were all too short or duplicated after cleanup');
   }
   return out;
 }
 
 /**
- * System prompt for top-level post generation. Differs from
- * persona.js's reply prompt in three ways:
- *   1. Explicitly says "you are posting, not replying" — without this,
- *      gpt-4o-mini will sometimes write replies to imagined tweets.
- *   2. Removes audience-aware framing (no thread to be seen in).
- *   3. Adds a "post must stand on its own" clause — there's no quoted
- *      tweet to provide context.
+ * System prompt for top-level post generation.
  *
- * Persona's hook techniques still apply here, but slightly differently:
- * the post itself must contain the hook, since there's no thread for
- * the reader to scroll into.
+ * Key differences from reply prompt:
+ *   1. "You are posting, not replying" — prevents phantom-reply structure
+ *   2. Emphasizes longer, substantive content (200-280 chars)
+ *   3. Feed-context awareness — writes posts that fit the current conversation
+ *   4. Hook engineering — every post must earn the reader's pause-and-read
  */
 function buildPostSystemPrompt(p) {
   const parts = [];
@@ -206,24 +212,40 @@ function buildPostSystemPrompt(p) {
   parts.push(
     'You are posting on X (Twitter) — top-level tweets, not replies. ' +
     'No quoted tweet, no thread context — each post must stand entirely ' +
-    'on its own. Reader sees only your post, with no prior context.',
+    'on its own. Reader sees only your post in their feed.',
   );
 
   parts.push(
-    'Each post should land a SPECIFIC observation, claim, or take in ' +
-    'one or two sentences. Use ONE of these structures per post: ' +
-    '(a) contrarian take with a one-line reason, ' +
-    '(b) specific number/data point + your read, ' +
-    '(c) tactical observation about market/protocol mechanics, ' +
-    '(d) personal stake ("I just X because Y"), ' +
-    '(e) reframing question. Avoid generic "thoughts on the market" filler.',
+    'IMPORTANT: Each post must be 200-280 characters. This is NOT optional. ' +
+    'Use the full character space to deliver substance. Short one-liners ' +
+    'get scrolled past. Substantive posts with a clear hook + supporting ' +
+    'detail earn engagement.',
   );
 
   parts.push(
-    'Hard prohibitions: no hashtags unless natural, no 🚀🔥💎✨ emoji, ' +
+    'Post structure (2-4 sentences total, filling 200-280 chars):\n' +
+    '1. HOOK — an unexpected claim, contrarian angle, specific data point, ' +
+    'or pattern observation that makes people stop scrolling\n' +
+    '2. SUBSTANCE — explain WHY, cite a mechanism, name a protocol/metric, ' +
+    'or share a personal stake that grounds the hook in reality\n' +
+    '3. (optional) CLOSER — a question, prediction, or call-to-discuss ' +
+    'that invites replies',
+  );
+
+  parts.push(
+    'Content that works: specific numbers/percentages, named protocols ' +
+    'and mechanisms, "I noticed X because Y" observations, contrarian ' +
+    'takes with a one-line reason, connecting two unrelated trends, ' +
+    'sharing a real position/trade/action you took and why.',
+  );
+
+  parts.push(
+    'Hard prohibitions: no hashtags unless natural, no 🚀🔥💎✨ emoji spam, ' +
     'no "GM" / "WAGMI" / "LFG" boilerplate, no shilling specific tickers ' +
-    'with a price target, no "DYOR / not financial advice" — that reads ' +
-    'as bot/promo. Stay in voice.',
+    'with price targets, no "DYOR / NFA" — that reads as bot/promo. ' +
+    'No generic "interesting times" filler. No starting with "Just..." ' +
+    'or "So...". Stay in voice.',
   );
-  return parts.join(' ');
+
+  return parts.join('\n\n');
 }

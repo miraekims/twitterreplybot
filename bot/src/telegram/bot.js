@@ -1058,14 +1058,26 @@ function cmdPost(msg, text) {
 // limit).
 async function cmdDraft(msg, topic) {
   if (!topic || !topic.trim()) {
+    // Try to suggest topics from feed if available
+    const { getRecentFeedSample } = await import('../campaign/runner.js');
+    const sample = getRecentFeedSample(5);
+    const feedHint = sample.length > 0
+      ? '\n\n💡 Hot in your feed right now:\n' +
+        sample.slice(0, 5).map((t) => {
+          const snippet = t.text.replace(/\n/g, ' ').slice(0, 60);
+          return `  • "${snippet}..." (@${t.authorHandle})`;
+        }).join('\n') +
+        '\n\nTry: /draft <one of these topics>'
+      : '';
     return bot.sendMessage(msg.chat.id,
       'Usage: /draft <topic>\n\n' +
       'Examples:\n' +
       '  /draft eth gas trends this week\n' +
       '  /draft why funding rates lie about sentiment\n' +
       '  /draft state of restaking after eigenlayer slashing\n\n' +
-      'AI generates 3 candidates in your campaign\'s persona voice. ' +
-      'You pick one to publish (or regen / skip).');
+      'AI generates 3 candidates (200-280 chars each) in your persona ' +
+      'voice, informed by what\'s trending in your feed. ' +
+      'You pick one to publish (or regen / skip).' + feedHint);
   }
   const cId = pickActiveCampaign(msg.from.id);
   if (!cId) return;
@@ -1074,10 +1086,8 @@ async function cmdDraft(msg, topic) {
   try { cfg = JSON.parse(c.config_json); } catch {}
 
   // Acknowledge before the API call — generateDrafts can take 5-15s.
-  // Without this, the user sits staring at nothing wondering if it
-  // hung, which causes them to retry, double-billing the OpenAI call.
   const waitMsg = await bot.sendMessage(msg.chat.id,
-    '🧠 Generating 3 candidates...');
+    '🧠 Generating 3 candidates (200-280 chars, feed-aware)...');
 
   let candidates;
   try {
@@ -1103,7 +1113,7 @@ async function cmdDraft(msg, topic) {
       topic: topic.trim(),
     });
     await bot.sendMessage(msg.chat.id,
-      `Candidate ${i + 1}/${candidates.length} — ${text.length} chars\n\n${text}`,
+      `📝 ${i + 1}/${candidates.length} — ${text.length}/280 chars\n\n${text}`,
       {
         reply_markup: {
           inline_keyboard: [[
