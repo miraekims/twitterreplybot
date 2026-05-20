@@ -91,15 +91,15 @@ function toast(msg) {
 function showDisconnected() {
   render(`
     <div id="disconnected" class="screen active">
-      <div style="text-align:center; padding-top:30vh;">
-        <div style="font-size:48px; margin-bottom:16px;">🔌</div>
-        <h2>Extension not connected</h2>
-        <p style="color:var(--hint); margin-top:8px; font-size:13px;">
-          Open Chrome with the X Reply Bot extension enabled<br>
-          and make sure you're logged into x.com
-        </p>
-        <button class="btn btn-primary" style="margin-top:24px; width:auto; padding:12px 32px;" onclick="init()">
-          Retry
+      <div class="discon-icon">🔌</div>
+      <h2 class="wizard-title" style="text-align:center;">Extension offline</h2>
+      <p class="wizard-subtitle" style="text-align:center;">
+        Open Chrome with the X Reply Bot extension enabled<br>
+        and make sure you're logged into x.com
+      </p>
+      <div style="display:flex; justify-content:center; margin-top:8px;">
+        <button class="btn btn-primary btn-cta" style="max-width:240px;" onclick="init()">
+          Retry connection
         </button>
       </div>
     </div>
@@ -110,6 +110,7 @@ function showDisconnected() {
 // ---------- Dashboard ----------
 function showDashboard() {
   const handle = state.status.handle || '?';
+  const avatarLetter = (handle && handle !== '?' ? handle[0] : '@').toUpperCase();
   const c = state.campaigns[0]; // primary campaign
   state.currentCampaign = c;
   const statusDot = c.status === 'running' ? 'green' : c.status === 'error' ? 'red' : 'yellow';
@@ -118,7 +119,7 @@ function showDashboard() {
   render(`
     <div id="dashboard" class="screen active">
       <div class="header">
-        <div class="avatar">@</div>
+        <div class="avatar">${avatarLetter}</div>
         <div class="info">
           <h2>@${handle}</h2>
           <div class="status">
@@ -132,33 +133,31 @@ function showDashboard() {
         <div class="card">
           <h3>Today</h3>
           <div class="value">${c.sentLastHour || 0}</div>
-          <div class="sub">replies/hour</div>
+          <div class="sub">replies / hour</div>
         </div>
         <div class="card">
           <h3>Total</h3>
           <div class="value">${c.sentTotal || 0}</div>
-          <div class="sub">~${c.dailyEstimate || 0}/day capacity</div>
+          <div class="sub">~${c.dailyEstimate || 0} / day capacity</div>
         </div>
       </div>
 
       <div class="btn-row">
         ${c.status === 'running'
           ? '<button class="btn btn-danger" onclick="pauseCampaign()">Pause</button>'
-          : '<button class="btn btn-success" onclick="runCampaign()">Run</button>'
+          : '<button class="btn btn-success btn-cta" onclick="runCampaign()">Run</button>'
         }
         <button class="btn btn-outline" onclick="showSettings()">Settings</button>
       </div>
 
-      ${c.lastError ? `<div class="card" style="border-left:3px solid var(--danger); margin-top:12px;">
+      ${c.lastError ? `<div class="card error-card" style="margin-top:12px;">
         <h3>Last Error</h3>
-        <p style="font-size:12px;">${c.lastError}</p>
+        <p style="font-size:12px;">${escHtml(c.lastError)}</p>
       </div>` : ''}
 
-      <div style="margin-top:16px;">
-        <h3 style="font-size:13px; color:var(--hint); margin-bottom:8px;">CAMPAIGNS</h3>
-        ${state.campaigns.map(renderCampaignItem).join('')}
-        <button class="btn btn-outline" style="margin-top:8px;" onclick="startWizard()">+ New Campaign</button>
-      </div>
+      <div class="section-title">Campaigns</div>
+      ${state.campaigns.map(renderCampaignItem).join('')}
+      <button class="btn btn-outline" style="margin-top:8px;" onclick="startWizard()">+ New Campaign</button>
 
       ${renderNav('home')}
     </div>
@@ -406,17 +405,17 @@ function wizardPacing() {
       const p = presetInfo[k];
       const isSelected = k === selected;
       return `
-        <div class="card" style="cursor:pointer; ${isSelected ? 'border:2px solid var(--link);' : ''}" onclick="pickPacing('${k}')">
+        <div class="card ${isSelected ? 'selected' : ''}" style="cursor:pointer;" onclick="pickPacing('${k}')">
           <div style="display:flex; justify-content:space-between; align-items:center;">
-            <strong style="text-transform:capitalize;">${k}</strong>
-            ${isSelected ? '<span style="color:var(--link);">Selected</span>' : ''}
+            <strong style="text-transform:uppercase; letter-spacing:0.12em; font-size:14px;">${k}</strong>
+            ${isSelected ? '<span style="color:var(--neon); font-size:11px; letter-spacing:0.18em; text-transform:uppercase;">Selected</span>' : ''}
           </div>
-          <div class="sub">${p.maxRepliesPerHour}/h, delay ${p.minDelaySec}-${p.maxDelaySec}s</div>
+          <div class="sub" style="margin-top:6px;">${p.maxRepliesPerHour}/h · delay ${p.minDelaySec}-${p.maxDelaySec}s</div>
         </div>
       `;
     }).join('')}
     <div class="hint" style="margin-top:8px;">
-      safe = ~170/day (new accounts), medium = ~510/day, highvolume = ~1000/day (risky!)
+      safe = ~170/day (new accounts) · medium = ~510/day · highvolume = ~1000/day (risky!)
     </div>
     <div class="btn-row">
       <button class="btn btn-outline" onclick="wizardBack()">Back</button>
@@ -457,7 +456,7 @@ function wizardConfirm() {
     </div>
     <div class="btn-row">
       <button class="btn btn-outline" onclick="wizardBack()">Back</button>
-      <button class="btn btn-success" onclick="submitWizard()">Create Campaign</button>
+      <button class="btn btn-success btn-cta" onclick="submitWizard()">Create Campaign</button>
     </div>
   `;
 }
@@ -649,7 +648,7 @@ async function showAiSettings() {
       <div class="wizard-title">AI Settings</div>
       <div class="wizard-subtitle">Configure OpenAI/Groq for persona-aware replies and /draft generation</div>
 
-      <div class="card" style="border-left:3px solid ${hasKey ? 'var(--success)' : 'var(--warn)'};">
+      <div class="card ${hasKey ? 'success-card' : 'warn-card'}">
         <h3>Status</h3>
         <p>${hasKey ? '✅ AI key configured — replies are persona-aware' : '⚠️ No AI key — using literal templates only'}</p>
       </div>
