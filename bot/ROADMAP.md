@@ -62,21 +62,30 @@ manually, posted via existing CreateTweet capability.
   - 📝 Posts menu section now shows live commands instead of
     placeholder copy
 
-## PR 3 — Sectioned UI, granular settings panel
+## PR 3 — Sectioned UI, granular settings panel ✅ this PR
 
 Goal: replace command memorization with a navigable menu.
 
 - `/menu` opens main menu (Campaigns / Settings / Personas /
-  Posts / Diagnostics) — already stubbed in PR1
-- Per-section sub-menus with all current settings exposed as
-  inline buttons + value-edit prompts
-- Settings panel covers: pacing, sleep window, filters
-  (minLikes, minFollowers, langs, skipReplies, skipRetweets),
-  persona swap, template hot-reload
+  Posts / API key / Diagnose / Help) — navigable now, no
+  longer placeholder text on Settings/Personas
+- `/settings [id]` — full per-campaign panel (slash + via menu)
+- Settings panel covers: pacing presets, sleep window
+  (toggle + custom hours), persona swap, templates
+  hot-reload, all filter knobs (minLikes, minFollowers,
+  minAge, maxAge, langs, blacklist words, blacklist handles,
+  skipReplies/Retweets/Quotes/WithUrls), author cooldown
+- Persona swap mid-campaign: `/menu` → 🎭 Personas → preset
+  picker (separate `psw:` callback prefix so it doesn't
+  collide with the /new flow's `ppreset:` handler)
 - All existing slash commands keep working (backward
   compatible)
-
-Estimate: 1-2 days of work, ~400 lines.
+- Bug fixes: Anthropic API URL no longer pre-applied (Anthropic
+  is not OpenAI-compatible — routed through the baseUrl-first
+  proxy flow instead, so /draft doesn't break on first call);
+  /menu and /settings clear any stale settings-edit
+  conversation so the next typed value isn't misrouted into
+  the previous field.
 
 ## PR 4 — Trend extractor (free)
 

@@ -73,6 +73,12 @@ export function startTelegram() {
   bot.onText(/^\/preset(?:\s+(\d+)\s+(\w+))?/, (m, mt) => guard(m, () => cmdPreset(m, mt[1] && +mt[1], mt[2])));
   bot.onText(/^\/sleep\s+(\d+)\s+(on|off)$/, (m, mt) => guard(m, () => cmdSleep(m, +mt[1], mt[2])));
   bot.onText(/^\/diag(?:nose)?(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdDiagnose(m, mt[1] && +mt[1])));
+  // /settings [id] — granular per-campaign settings panel (filters,
+  // pacing, sleep window, persona swap, templates hot-reload). All
+  // existing slash commands keep working; this is the navigable
+  // version. Without an id we route through the campaign picker so
+  // the user doesn't have to remember campaign ids.
+  bot.onText(/^\/settings(?:\s+(\d+))?$/, (m, mt) => guard(m, () => cmdSettingsEntry(m, mt[1] && +mt[1])));
   bot.onText(/^\/menu$/, (m) => guard(m, () => cmdMenu(m)));
   // /post <text> — immediate-publish a top-level tweet. Bypasses /draft
   // entirely; user types own copy. Schedules at "now" so the runner
@@ -168,6 +174,7 @@ const HELP = [
   '/logs <id> — last 30 log lines',
   '/preset <id> <safe|medium|highvolume> — swap pacing profile',
   '/sleep <id> <on|off> — toggle sleep window (default 01:00-08:00)',
+  '/settings [id] — full settings panel (pacing, filters, persona, templates)',
   '/diagnose [id] — show bridge + captured-op health and tips',
   '/disconnect [id] — forget account row (Chrome session itself stays)',
   '',
@@ -198,6 +205,7 @@ const COMMAND_LIST = [
   { command: 'preset', description: 'Swap pacing — /preset <id> <name>' },
   { command: 'sleep', description: 'Sleep window — /sleep <id> on|off' },
   { command: 'diagnose', description: 'Bridge + captured-op health' },
+  { command: 'settings', description: 'Granular settings panel — /settings [id]' },
   { command: 'disconnect', description: 'Forget account row — /disconnect [id]' },
   { command: 'help', description: 'Show full help' },
   { command: 'post', description: 'Publish a tweet — /post <text>' },
@@ -508,6 +516,9 @@ function handleConversation(msg) {
   if (!conv) return;
   if (conv.kind === 'newCampaign') return stepNewCampaign(msg, conv);
   if (conv.kind === 'apikeyInput') return stepApiKeyInput(msg, conv);
+  if (conv.kind === 'settingsEdit') return stepSettingsEdit(msg, conv);
+  if (conv.kind === 'settingsSleep') return stepSettingsSleep(msg, conv);
+  if (conv.kind === 'settingsTemplates') return stepSettingsTemplates(msg, conv);
 }
 
 function stepNewCampaign(msg, conv) {
@@ -769,6 +780,42 @@ async function handleCallback(q) {
         // action ∈ openai | groq | custom | clear | show
         await handleApiKeyAction(q, idStr);
         break;
+      // ----- Settings panel (PR3) -----
+      // Prefixes:
+      //   set     — open settings panel for campaign id (idStr)
+      //   setpick — same, but coming from the campaign-picker sub-menu
+      //   setf    — flip a boolean filter; arg = field name
+      //   sete    — start an edit-conversation for a numeric/string field
+      //   sets    — start sleep-window edit conversation
+      //   setp    — open persona swap picker for this campaign
+      //   psw     — apply a persona preset to this campaign; arg = preset id
+      //   sett    — start templates hot-reload conversation
+      //   pswpick — campaign picker for persona swap (one extra hop)
+      case 'set':
+      case 'setpick':
+        await openSettingsPanel(q, +idStr);
+        break;
+      case 'setf':
+        await handleSettingFlip(q, +idStr, arg);
+        break;
+      case 'sete':
+        await handleSettingEditPrompt(q, +idStr, arg);
+        break;
+      case 'sets':
+        await handleSleepWindowPrompt(q, +idStr);
+        break;
+      case 'setp':
+        await openPersonaSwapPicker(q, +idStr);
+        break;
+      case 'psw':
+        await applyPersonaSwap(q, +idStr, arg);
+        break;
+      case 'sett':
+        await handleTemplatesPrompt(q, +idStr);
+        break;
+      case 'pswpick':
+        await openPersonaSwapPicker(q, +idStr);
+        break;
       default:
         await bot.answerCallbackQuery(q.id, { text: `Unknown action: ${action}` });
         return;
@@ -908,6 +955,9 @@ function buildMainMenuKeyboard() {
 }
 
 function cmdMenu(msg) {
+  // Same rationale as cmdSettingsEntry — the user opening /menu
+  // mid-conversation means "drop me out of the previous flow".
+  abandonSettingsConv(msg.chat.id);
   const bs = bridge.status();
   const bridgeLine = bs.connected
     ? `Bridge: ✓ @${bs.handle || '?'}`
@@ -929,22 +979,9 @@ async function handleMenuClick(q, section) {
     case 'campaigns':
       return cmdCampaigns(fakeMsg);
     case 'settings':
-      return bot.sendMessage(q.message.chat.id,
-        '⚙ Settings — per-campaign\n\n' +
-        'Pick a campaign first via 📣 Campaigns, then use:\n' +
-        '  /preset <id> safe|medium|highvolume — pacing\n' +
-        '  /sleep <id> on|off — quiet hours\n\n' +
-        'Granular settings panel (likes threshold, follower threshold, ' +
-        'language filter, skip replies/retweets) is in PR2 — see ' +
-        'bot/ROADMAP.md.');
+      return openSettingsCampaignPicker(fakeMsg);
     case 'personas':
-      return bot.sendMessage(q.message.chat.id,
-        '🎭 Personas\n\n' +
-        PERSONA_PRESETS.map((p) =>
-          `${p.label} — ${p.description}`,
-        ).join('\n\n') +
-        '\n\nPersonas are picked at /new time. Mid-campaign swap is ' +
-        'planned for PR2.');
+      return openPersonaSwapCampaignPicker(fakeMsg);
     case 'posts':
       return bot.sendMessage(q.message.chat.id,
         '📝 Posts — auto-post engine (live)\n\n' +
@@ -1083,7 +1120,6 @@ async function cmdDraft(msg, topic) {
 
 // ---------- /queue — drafts + scheduled posts ----------
 function cmdQueue(msg) {
-  const accountIds = db.listAccounts(msg.from.id).map((a) => a.id);
   const allCampaigns = db.listCampaigns(msg.from.id);
   const ownedIds = allCampaigns.map((c) => c.id);
   if (!ownedIds.length) {
@@ -1441,6 +1477,28 @@ async function handleApiKeyAction(q, action) {
       { parse_mode: 'Markdown' });
   }
 
+  if (action === 'anthropic') {
+    // Anthropic API is NOT natively OpenAI-compatible. Pre-filling
+    // baseUrl=api.anthropic.com would break /draft on the next call
+    // because the chat/completions shape we send isn't accepted there.
+    // Route through the baseUrl-first conversation instead so the user
+    // explicitly points at a translating proxy (LiteLLM / claude-bridge).
+    // Suggested model is carried forward via conv.data so we can apply
+    // it together with the user-supplied baseUrl.
+    conversations.set(chatId, {
+      kind: 'apikeyInput',
+      step: 'baseUrl',
+      data: { provider: 'anthropic', model: provider.suggestedModel },
+    });
+    return bot.sendMessage(chatId,
+      '🧠 Anthropic — Claude does NOT speak OpenAI chat/completions ' +
+      'natively. Run a translating proxy first, then paste its base URL.\n\n' +
+      'Recommended: LiteLLM (https://docs.litellm.ai). Run it locally, ' +
+      'point it at your sk-ant-... key, and the proxy exposes an ' +
+      `OpenAI-compatible /v1 endpoint. Suggested model: ${provider.suggestedModel}.\n\n` +
+      'Paste the proxy base URL now (e.g. http://localhost:4000/v1).');
+  }
+
   // Known provider — pre-fill baseUrl and model, ask only for the key.
   // Apply baseUrl + model immediately; key arrives in next user message.
   db.setSetting('OPENAI_BASE_URL', provider.baseUrl);
@@ -1484,6 +1542,13 @@ function stepApiKeyInput(msg, conv) {
       db.setSetting('OPENAI_BASE_URL', conv.data.baseUrl);
       process.env.OPENAI_BASE_URL = conv.data.baseUrl;
     }
+    if (conv.data.model) {
+      // Carry-over from anthropic-via-proxy flow: we suggested a Claude
+      // model up front and pinned it in conv.data so the proxy receives
+      // a usable model string from the first /draft call.
+      db.setSetting('OPENAI_MODEL', conv.data.model);
+      process.env.OPENAI_MODEL = conv.data.model;
+    }
     db.setSetting('OPENAI_API_KEY', text);
     process.env.OPENAI_API_KEY = text;
     conversations.delete(msg.chat.id);
@@ -1526,4 +1591,675 @@ function clearApiKey(chatId) {
   return bot.sendMessage(chatId,
     '🗑 Cleared OPENAI_API_KEY / OPENAI_MODEL / OPENAI_BASE_URL.\n\n' +
     'AI replies and /draft are now disabled. Use /apikey to set up again.');
+}
+
+
+
+// ============================================================
+// Settings panel (PR3)
+// ============================================================
+//
+// Goal: the user controls every per-campaign knob from inline
+// keyboards instead of remembering /preset, /sleep, and direct
+// config_json edits. All existing slash commands continue to work
+// — this layer is purely additive.
+//
+// Navigation:
+//   /menu → ⚙ Settings → (campaign picker if >1) → settings panel
+//   /settings [id] → settings panel directly
+//
+// Panel layout: a single editable message that re-renders in place
+// after each toggle. Fields that take a value (numbers, lists,
+// sleep window, templates) start a small text-prompt conversation
+// in the same chat.
+//
+// callback_data prefixes used here (≤16 chars total to stay under
+// Telegram's 64-byte cap with id + arg):
+//   set:<id>            open settings panel for campaign
+//   setpick:<id>        same; alias used by campaign picker
+//   setf:<id>:<field>   flip a boolean filter (skipReplies, ...)
+//   sete:<id>:<field>   start edit conversation for a value field
+//   sets:<id>           start sleep-window edit conversation
+//   setp:<id>           open persona swap picker for campaign
+//   psw:<id>:<presetId> apply persona preset to campaign
+//   pswpick:<id>        campaign picker for persona swap
+//   sett:<id>           start templates hot-reload conversation
+
+// Field metadata for value-edit prompts. Centralised so the prompt
+// text, validation, parsing and storage location are co-located —
+// adding a new field is one entry here, no other code changes.
+const SETTING_FIELDS = {
+  minLikes: {
+    label: '👍 minLikes',
+    where: 'filters',
+    desc: 'Skip tweets with fewer than this many likes.',
+    type: 'int', min: 0, max: 100000,
+  },
+  minAuthorFollowers: {
+    label: '👥 minFollowers',
+    where: 'filters',
+    desc: 'Skip tweets from authors below this follower count.',
+    type: 'int', min: 0, max: 100000000,
+  },
+  minTweetAgeSec: {
+    label: '⏱ minAge (sec)',
+    where: 'filters',
+    desc: 'Skip tweets younger than this many seconds (lets engagement settle).',
+    type: 'int', min: 0, max: 86400,
+  },
+  maxAgeMinutes: {
+    label: '⏳ maxAge (min)',
+    where: 'filters',
+    desc: 'Skip tweets older than this many minutes.',
+    type: 'int', min: 1, max: 60 * 24 * 7,
+  },
+  langs: {
+    label: '🌐 langs',
+    where: 'filters',
+    desc: 'Comma-separated language codes (e.g. "en, ru"). Empty list = any.',
+    type: 'list',
+  },
+  blacklistWords: {
+    label: '⛔ block words',
+    where: 'filters',
+    desc: 'Comma-separated words to skip if they appear anywhere in tweet text.',
+    type: 'list',
+  },
+  blacklistHandles: {
+    label: '⛔ block handles',
+    where: 'filters',
+    desc: 'Comma-separated @handles to never reply to.',
+    type: 'list',
+  },
+  authorCooldownHours: {
+    label: '⏳ author cooldown (h)',
+    where: 'pacing',
+    desc: 'Hours to wait before replying to the same @handle again.',
+    type: 'int', min: 0, max: 24 * 30,
+  },
+};
+
+// Boolean filter flags surfaced as one-tap toggles.
+const SETTING_TOGGLES = [
+  { field: 'skipReplies',  label: '💬 skipReplies' },
+  { field: 'skipRetweets', label: '🔁 skipRetweets' },
+  { field: 'skipQuotes',   label: '💭 skipQuotes' },
+  { field: 'skipWithUrls', label: '🔗 skipWithUrls' },
+];
+
+// /settings [id] entry point. Same routing as /menu Settings:
+//   - 0 campaigns → nudge to /new
+//   - 1 campaign → open panel directly
+//   - many → render picker
+function cmdSettingsEntry(msg, id) {
+  // Clear any stale settings conversation. The user pressing /settings
+  // mid-edit is an explicit signal that they want to restart — keeping
+  // the old conv alive would mis-route their next typed value into the
+  // previous field.
+  abandonSettingsConv(msg.chat.id);
+  if (id != null) {
+    return showSettingsPanel(msg.chat.id, id, /* edit */ false);
+  }
+  return openSettingsCampaignPicker(msg);
+}
+
+function abandonSettingsConv(chatId) {
+  const conv = conversations.get(chatId);
+  if (!conv) return;
+  if (conv.kind === 'settingsEdit' || conv.kind === 'settingsSleep' || conv.kind === 'settingsTemplates') {
+    conversations.delete(chatId);
+  }
+}
+
+// Picker that lists the user's campaigns with a button per row. We
+// reuse this for the /menu → Settings entry too. When only one
+// campaign exists we skip the picker and go straight to the panel,
+// since picking from a list of one is a wasted tap.
+function openSettingsCampaignPicker(msg) {
+  const list = db.listCampaigns(msg.from.id);
+  if (!list.length) {
+    return bot.sendMessage(msg.chat.id,
+      'No campaigns yet. Use /new to create one before editing settings.');
+  }
+  if (list.length === 1) {
+    return showSettingsPanel(msg.chat.id, list[0].id, /* edit */ false);
+  }
+  const rows = list.map((c) => [{
+    text: `${statusDot(c.status)} #${c.id} ${c.name}`,
+    callback_data: `setpick:${c.id}`,
+  }]);
+  return bot.sendMessage(msg.chat.id,
+    '⚙ Settings — pick a campaign:',
+    { reply_markup: { inline_keyboard: rows } });
+}
+
+function statusDot(status) {
+  return status === 'running' ? '🟢'
+       : status === 'paused' ? '⏸'
+       : status === 'error' ? '🔴'
+       : '⚫';
+}
+
+// Open settings panel from a callback (campaign picker tap, or
+// the dedicated "back to settings" button on a sub-screen). Edits
+// the message in place where possible so we don't litter the chat
+// with stale panels.
+async function openSettingsPanel(q, id) {
+  const c = db.getCampaign(id);
+  if (!c) {
+    return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  }
+  const { text, keyboard } = renderSettingsPanel(c);
+  await bot.editMessageText(text, {
+    chat_id: q.message.chat.id,
+    message_id: q.message.message_id,
+    reply_markup: { inline_keyboard: keyboard },
+  }).catch(async () => {
+    // editMessageText fails if the message is too old, in another
+    // chat, or wasn't ours. Fall back to a fresh message rather
+    // than dropping the action.
+    await bot.sendMessage(q.message.chat.id, text, {
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  });
+}
+
+// Send a fresh settings panel (no source message to edit). Used by
+// /settings <id> and from the no-picker branch above.
+async function showSettingsPanel(chatId, id, _edit = false) {
+  const c = db.getCampaign(id);
+  if (!c) {
+    return bot.sendMessage(chatId, `No such campaign #${id}.`);
+  }
+  const { text, keyboard } = renderSettingsPanel(c);
+  return bot.sendMessage(chatId, text, {
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+// Render text + keyboard for the panel. We keep the formatter pure
+// (no I/O) so it's trivially callable from both the /settings flow
+// and any future re-render after value edits.
+function renderSettingsPanel(c) {
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch { cfg = {}; }
+  const filters = cfg.filters || {};
+  const pacing = cfg.pacing || {};
+  const sleep = cfg.sleep || {};
+  const templates = Array.isArray(cfg.templates) ? cfg.templates : [];
+
+  // Pacing summary uses the same labels /preset prints, so the
+  // mental model stays consistent. Daily estimate factors sleep.
+  const presetName = inferPresetName(pacing) || 'custom';
+  const daily = expectedDailyReplies(cfg);
+  const personaLabel = cfg.persona?.name
+    ? cfg.persona.name + (cfg.persona.examples?.length ? ` (${cfg.persona.examples.length} ex.)` : '')
+    : '(neutral default)';
+
+  const lines = [
+    `⚙ Settings — c#${c.id} "${c.name}"`,
+    `${statusDot(c.status)} status: ${c.status}, sent total: ${c.sent_total}`,
+    '',
+    `📊 Pacing: ${presetName} — ${pacing.maxRepliesPerHour ?? '?'}/h, ` +
+      `delay ${pacing.minDelaySec ?? '?'}-${pacing.maxDelaySec ?? '?'}s ` +
+      `(~${daily}/day with current sleep)`,
+    `🌙 Sleep: ${sleep.enabled ? 'ON' : 'OFF'} ${sleep.startHHMM || '??:??'}-${sleep.endHHMM || '??:??'}`,
+    `🎭 Persona: ${personaLabel}`,
+    `📝 Templates: ${templates.length} entries`,
+    `⏳ Author cooldown: ${pacing.authorCooldownHours ?? 24}h`,
+    '',
+    'Filters:',
+    `  👍 minLikes: ${filters.minLikes ?? 0}`,
+    `  👥 minFollowers: ${filters.minAuthorFollowers ?? 0}`,
+    `  ⏱ minAge: ${filters.minTweetAgeSec ?? 0}s`,
+    `  ⏳ maxAge: ${filters.maxAgeMinutes ?? '?'}min`,
+    `  💬 skipReplies: ${onOff(filters.skipReplies)}`,
+    `  🔁 skipRetweets: ${onOff(filters.skipRetweets)}`,
+    `  💭 skipQuotes: ${onOff(filters.skipQuotes)}`,
+    `  🔗 skipWithUrls: ${onOff(filters.skipWithUrls)}`,
+    `  🌐 langs: ${formatList(filters.langs)}`,
+    `  ⛔ block words: ${(filters.blacklistWords || []).length}`,
+    `  ⛔ block handles: ${(filters.blacklistHandles || []).length}`,
+  ];
+
+  // Build keyboard rows. Telegram caps text on each button (~32
+  // visible chars) and we want every row balanced, so values that
+  // are dynamic (current state) are echoed in the button text on
+  // toggles — saves the user a re-read.
+  const k = [];
+  // Pacing presets row
+  k.push([
+    { text: '🐢 safe', callback_data: `preset:${c.id}:safe` },
+    { text: '🚶 medium', callback_data: `preset:${c.id}:medium` },
+    { text: '🚀 highvolume', callback_data: `preset:${c.id}:highvolume` },
+  ]);
+  // Sleep row — toggle + edit-hours
+  k.push([
+    sleep.enabled
+      ? { text: '☀️ Sleep OFF', callback_data: `sleep:${c.id}:off` }
+      : { text: '🌙 Sleep ON', callback_data: `sleep:${c.id}:on` },
+    { text: '🛌 Edit sleep hours', callback_data: `sets:${c.id}` },
+  ]);
+  // Persona swap + templates hot-reload + author cooldown edit
+  k.push([
+    { text: '🎭 Swap persona', callback_data: `setp:${c.id}` },
+    { text: '📝 Replace templates', callback_data: `sett:${c.id}` },
+  ]);
+  k.push([
+    { text: `⏳ author cooldown (${pacing.authorCooldownHours ?? 24}h)`,
+      callback_data: `sete:${c.id}:authorCooldownHours` },
+  ]);
+  // Filter value edits
+  k.push([
+    { text: `👍 minLikes (${filters.minLikes ?? 0})`,
+      callback_data: `sete:${c.id}:minLikes` },
+    { text: `👥 minFollowers (${filters.minAuthorFollowers ?? 0})`,
+      callback_data: `sete:${c.id}:minAuthorFollowers` },
+  ]);
+  k.push([
+    { text: `⏱ minAge (${filters.minTweetAgeSec ?? 0}s)`,
+      callback_data: `sete:${c.id}:minTweetAgeSec` },
+    { text: `⏳ maxAge (${filters.maxAgeMinutes ?? '?'}min)`,
+      callback_data: `sete:${c.id}:maxAgeMinutes` },
+  ]);
+  // Filter toggles — render in pairs of two for visual density.
+  for (let i = 0; i < SETTING_TOGGLES.length; i += 2) {
+    const row = [];
+    for (let j = 0; j < 2 && i + j < SETTING_TOGGLES.length; j++) {
+      const t = SETTING_TOGGLES[i + j];
+      const on = !!filters[t.field];
+      row.push({
+        text: `${t.label}: ${on ? 'ON' : 'OFF'}`,
+        callback_data: `setf:${c.id}:${t.field}`,
+      });
+    }
+    k.push(row);
+  }
+  // List filter edits
+  k.push([
+    { text: `🌐 langs`, callback_data: `sete:${c.id}:langs` },
+    { text: `⛔ block words`, callback_data: `sete:${c.id}:blacklistWords` },
+    { text: `⛔ block handles`, callback_data: `sete:${c.id}:blacklistHandles` },
+  ]);
+  // Run/pause/stop + stats — same as /campaigns row
+  const ctrlRow = [];
+  if (c.status === 'running') {
+    ctrlRow.push({ text: '⏸ Pause', callback_data: `pause:${c.id}` });
+  } else {
+    ctrlRow.push({ text: '▶ Run', callback_data: `run:${c.id}` });
+  }
+  if (c.status !== 'idle') {
+    ctrlRow.push({ text: '🛑 Stop', callback_data: `stop:${c.id}` });
+  }
+  ctrlRow.push({ text: '📊 Stats', callback_data: `stats:${c.id}` });
+  ctrlRow.push({ text: '🔄 Refresh', callback_data: `set:${c.id}` });
+  k.push(ctrlRow);
+  return { text: lines.join('\n'), keyboard: k };
+}
+
+function onOff(b) { return b ? 'ON' : 'OFF'; }
+function formatList(v) {
+  if (!Array.isArray(v) || v.length === 0) return '(any)';
+  return v.join(', ');
+}
+
+// Best-effort match of pacing to a named preset. We compare on the
+// three knobs that distinguish them; anything else is "custom".
+// Avoids importing PRESETS for a deep equals check.
+function inferPresetName(pacing) {
+  if (!pacing) return null;
+  for (const [name, p] of Object.entries(PRESETS)) {
+    if (
+      pacing.maxRepliesPerHour === p.maxRepliesPerHour &&
+      pacing.minDelaySec === p.minDelaySec &&
+      pacing.maxDelaySec === p.maxDelaySec
+    ) return name;
+  }
+  return null;
+}
+
+// ----- Toggle handler -----
+//
+// One callback per filter flip. Re-renders the panel in place so
+// the user gets immediate visual confirmation that the toggle took.
+async function handleSettingFlip(q, id, field) {
+  if (!field || !SETTING_TOGGLES.find((t) => t.field === field)) {
+    return bot.sendMessage(q.message.chat.id, `Unknown toggle: ${field}`);
+  }
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    return bot.sendMessage(q.message.chat.id, `corrupt config_json: ${e.message}`);
+  }
+  cfg.filters = cfg.filters || {};
+  cfg.filters[field] = !cfg.filters[field];
+  db.setCampaignConfig(id, JSON.stringify(cfg));
+  await openSettingsPanel(q, id);
+}
+
+// ----- Value-edit prompt -----
+//
+// Tap a value-field button → bot prompts for the new value via a
+// fresh chat message. We DON'T edit the panel itself here, because
+// the panel is keyboard-only; the value comes through a follow-up
+// text message handled by stepSettingsEdit.
+async function handleSettingEditPrompt(q, id, field) {
+  const meta = SETTING_FIELDS[field];
+  if (!meta) {
+    return bot.sendMessage(q.message.chat.id, `Unknown field: ${field}`);
+  }
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  let cfg = {};
+  try { cfg = JSON.parse(c.config_json); } catch {}
+  const current = readField(cfg, meta.where, field);
+  const currentLabel = meta.type === 'list'
+    ? formatList(current)
+    : String(current ?? '(unset)');
+
+  conversations.set(q.message.chat.id, {
+    kind: 'settingsEdit',
+    campaignId: id,
+    field,
+    where: meta.where,
+    type: meta.type,
+    meta,
+  });
+
+  const constraints = meta.type === 'int'
+    ? `Send a whole number (min ${meta.min}, max ${meta.max}).`
+    : meta.type === 'list'
+    ? 'Send a comma-separated list. Send "-" or "none" to clear.'
+    : 'Send the new value.';
+
+  return bot.sendMessage(q.message.chat.id,
+    `Editing ${meta.label} for c#${id}.\n` +
+    `${meta.desc}\n\n` +
+    `Current: ${currentLabel}\n\n` +
+    `${constraints}`);
+}
+
+function readField(cfg, where, field) {
+  if (where === 'filters') return (cfg.filters || {})[field];
+  if (where === 'pacing') return (cfg.pacing || {})[field];
+  return undefined;
+}
+function writeField(cfg, where, field, value) {
+  if (where === 'filters') (cfg.filters = cfg.filters || {})[field] = value;
+  else if (where === 'pacing') (cfg.pacing = cfg.pacing || {})[field] = value;
+}
+
+// Conversation step: parse the user's text against the field's
+// expected type, store in cfg.{filters|pacing}, persist, ack.
+function stepSettingsEdit(msg, conv) {
+  const text = msg.text.trim();
+  const meta = conv.meta;
+  let parsed;
+
+  if (meta.type === 'int') {
+    if (!/^-?\d+$/.test(text)) {
+      return bot.sendMessage(msg.chat.id,
+        `Not a number: "${text}". Send a whole number, or /settings to abort.`);
+    }
+    const n = parseInt(text, 10);
+    if (n < (meta.min ?? -Infinity) || n > (meta.max ?? Infinity)) {
+      return bot.sendMessage(msg.chat.id,
+        `Out of range. Allowed: ${meta.min}..${meta.max}.`);
+    }
+    parsed = n;
+  } else if (meta.type === 'list') {
+    if (text === '-' || text.toLowerCase() === 'none') {
+      parsed = [];
+    } else {
+      parsed = text.split(',').map((s) => s.trim()).filter(Boolean);
+      // Normalise handle list — strip leading @, lowercase. Avoids
+      // the user-sees-they-typed-it-wrong-when-it-doesn't-match
+      // class of bug.
+      if (conv.field === 'blacklistHandles') {
+        parsed = parsed.map((s) => s.replace(/^@/, '').toLowerCase());
+      }
+      if (conv.field === 'langs') {
+        parsed = parsed.map((s) => s.toLowerCase());
+      }
+    }
+  } else {
+    parsed = text;
+  }
+
+  const c = db.getCampaign(conv.campaignId);
+  if (!c) {
+    conversations.delete(msg.chat.id);
+    return bot.sendMessage(msg.chat.id, `Campaign #${conv.campaignId} no longer exists.`);
+  }
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    conversations.delete(msg.chat.id);
+    return bot.sendMessage(msg.chat.id, `corrupt config_json: ${e.message}`);
+  }
+  writeField(cfg, conv.where, conv.field, parsed);
+  db.setCampaignConfig(conv.campaignId, JSON.stringify(cfg));
+  conversations.delete(msg.chat.id);
+
+  const newLabel = meta.type === 'list' ? formatList(parsed) : String(parsed);
+  return bot.sendMessage(msg.chat.id,
+    `✅ ${meta.label} for c#${conv.campaignId} → ${newLabel}\n\n` +
+    `Tap /settings ${conv.campaignId} to see the updated panel.`);
+}
+
+// ----- Sleep window edit -----
+//
+// Sleep is special because it's two values (start, end) plus an
+// enabled flag. We keep the existing /sleep <id> on|off command for
+// the toggle and route the panel's "Edit sleep hours" button into
+// a single-line conversation: "HH:MM HH:MM".
+async function handleSleepWindowPrompt(q, id) {
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  let cfg = {};
+  try { cfg = JSON.parse(c.config_json); } catch {}
+  const cur = cfg.sleep || {};
+  conversations.set(q.message.chat.id, {
+    kind: 'settingsSleep',
+    campaignId: id,
+  });
+  return bot.sendMessage(q.message.chat.id,
+    `Editing sleep window for c#${id}.\n` +
+    `Current: ${cur.startHHMM || '01:00'}-${cur.endHHMM || '08:00'} ` +
+    `(${cur.enabled ? 'ON' : 'OFF'})\n\n` +
+    `Send two HH:MM values separated by space or dash:\n` +
+    `  01:00 08:00\n  23:00-07:00\n\n` +
+    `Use /sleep ${id} on|off to toggle. /settings to abort.`);
+}
+
+function stepSettingsSleep(msg, conv) {
+  const text = msg.text.trim();
+  const m = text.match(/^(\d{1,2}:\d{2})\s*[-\s]\s*(\d{1,2}:\d{2})$/);
+  if (!m) {
+    return bot.sendMessage(msg.chat.id,
+      'Format: HH:MM HH:MM (e.g. "01:00 08:00" or "23:00-07:00"). Try again, or /settings to abort.');
+  }
+  const start = normaliseHHMM(m[1]);
+  const end = normaliseHHMM(m[2]);
+  if (!start || !end) {
+    return bot.sendMessage(msg.chat.id, `Invalid HH:MM. Use 24h time, e.g. 01:00 08:00.`);
+  }
+  const c = db.getCampaign(conv.campaignId);
+  if (!c) {
+    conversations.delete(msg.chat.id);
+    return bot.sendMessage(msg.chat.id, `Campaign #${conv.campaignId} no longer exists.`);
+  }
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    conversations.delete(msg.chat.id);
+    return bot.sendMessage(msg.chat.id, `corrupt config_json: ${e.message}`);
+  }
+  cfg.sleep = cfg.sleep || {};
+  cfg.sleep.startHHMM = start;
+  cfg.sleep.endHHMM = end;
+  db.setCampaignConfig(conv.campaignId, JSON.stringify(cfg));
+  conversations.delete(msg.chat.id);
+  return bot.sendMessage(msg.chat.id,
+    `✅ Sleep window for c#${conv.campaignId} → ${start}-${end}.\n` +
+    `Use /sleep ${conv.campaignId} on to enable.`);
+}
+
+function normaliseHHMM(s) {
+  const m = String(s).match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = +m[1], min = +m[2];
+  if (h < 0 || h > 23) return null;
+  if (min < 0 || min > 59) return null;
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+// ----- Persona swap (mid-campaign) -----
+//
+// Re-uses the preset registry. We don't reuse the `ppreset:` callback
+// prefix because it's bound to the /new flow's conversation state;
+// a separate `psw:<id>:<presetId>` keeps the two flows orthogonal.
+async function openPersonaSwapPicker(q, id) {
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  // Two-column preset grid + custom + skip + back.
+  const buttons = PERSONA_PRESETS.map((p) => ({
+    text: p.label,
+    callback_data: `psw:${id}:${p.id}`,
+  }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    rows.push(buttons.slice(i, i + 2));
+  }
+  rows.push([
+    { text: '🗑 Clear (neutral)', callback_data: `psw:${id}:_clear` },
+    { text: '⬅ Back to settings', callback_data: `set:${id}` },
+  ]);
+  let cfg = {};
+  try { cfg = JSON.parse(c.config_json); } catch {}
+  const cur = cfg.persona?.name || '(neutral default)';
+  await bot.editMessageText(
+    `🎭 Persona swap for c#${id} "${c.name}"\n` +
+    `Current: ${cur}\n\n` +
+    `Pick a preset (full bio + style + 10 examples preloaded), or clear.`,
+    {
+      chat_id: q.message.chat.id,
+      message_id: q.message.message_id,
+      reply_markup: { inline_keyboard: rows },
+    },
+  ).catch(async () => {
+    await bot.sendMessage(q.message.chat.id,
+      `🎭 Persona swap for c#${id}.`,
+      { reply_markup: { inline_keyboard: rows } });
+  });
+}
+
+async function applyPersonaSwap(q, id, presetId) {
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    return bot.sendMessage(q.message.chat.id, `corrupt config_json: ${e.message}`);
+  }
+
+  if (presetId === '_clear') {
+    cfg.persona = null;
+    db.setCampaignConfig(id, JSON.stringify(cfg));
+    await openSettingsPanel(q, id);
+    return;
+  }
+
+  const persona = getPreset(presetId);
+  if (!persona) {
+    return bot.sendMessage(q.message.chat.id,
+      `Unknown preset "${presetId}".`);
+  }
+  cfg.persona = persona;
+  db.setCampaignConfig(id, JSON.stringify(cfg));
+  await openSettingsPanel(q, id);
+}
+
+// /menu → 🎭 Personas → campaign picker → swap. With one campaign
+// we go straight to the picker like Settings does.
+function openPersonaSwapCampaignPicker(msg) {
+  const list = db.listCampaigns(msg.from.id);
+  if (!list.length) {
+    return bot.sendMessage(msg.chat.id,
+      'No campaigns. Use /new to create one (the persona is picked there).');
+  }
+  if (list.length === 1) {
+    // Synthesize a fake callback so we land in the same UI.
+    const fakeQ = {
+      from: msg.from,
+      message: { chat: msg.chat, message_id: msg.message_id },
+    };
+    return openPersonaSwapPicker(fakeQ, list[0].id);
+  }
+  const rows = list.map((c) => {
+    let cfg = {};
+    try { cfg = JSON.parse(c.config_json); } catch {}
+    const personaName = cfg.persona?.name || 'neutral';
+    return [{
+      text: `${statusDot(c.status)} #${c.id} ${c.name} — ${personaName}`,
+      callback_data: `pswpick:${c.id}`,
+    }];
+  });
+  return bot.sendMessage(msg.chat.id,
+    '🎭 Persona swap — pick a campaign:',
+    { reply_markup: { inline_keyboard: rows } });
+}
+
+// ----- Templates hot-reload -----
+//
+// Re-paste the entire templates blob (one entry per line, same
+// "tags | text" / "text" syntax as /new). Replaces the existing
+// list outright. No partial merge — that would be confusing UX
+// (users would forget what's currently saved). For partial edits
+// the user can /settings <id> → see the count, then re-paste their
+// full list.
+async function handleTemplatesPrompt(q, id) {
+  const c = db.getCampaign(id);
+  if (!c) return bot.sendMessage(q.message.chat.id, `No such campaign #${id}.`);
+  conversations.set(q.message.chat.id, {
+    kind: 'settingsTemplates',
+    campaignId: id,
+  });
+  return bot.sendMessage(q.message.chat.id,
+    `📝 Replace templates for c#${id} "${c.name}".\n\n` +
+    `Send the full new template list, one per line. Same format as /new:\n` +
+    `  tags, more, tags | reply text\n` +
+    `  reply text             ← no tags = catch-all\n\n` +
+    `Send "-" to clear all templates (campaign will skip every tweet ` +
+    `until you re-add some).\n\n` +
+    `/settings to abort.`);
+}
+
+function stepSettingsTemplates(msg, conv) {
+  const text = msg.text || '';
+  const c = db.getCampaign(conv.campaignId);
+  if (!c) {
+    conversations.delete(msg.chat.id);
+    return bot.sendMessage(msg.chat.id, `Campaign #${conv.campaignId} no longer exists.`);
+  }
+  let cfg;
+  try { cfg = JSON.parse(c.config_json); } catch (e) {
+    conversations.delete(msg.chat.id);
+    return bot.sendMessage(msg.chat.id, `corrupt config_json: ${e.message}`);
+  }
+  let parsed;
+  if (text.trim() === '-') {
+    parsed = [];
+  } else {
+    parsed = parseTemplates(text);
+    if (!parsed.length) {
+      return bot.sendMessage(msg.chat.id,
+        `No valid templates parsed. Each line must be either "text" ` +
+        `(catch-all) or "tags | text". Try again, or /settings to abort.`);
+    }
+  }
+  cfg.templates = parsed;
+  db.setCampaignConfig(conv.campaignId, JSON.stringify(cfg));
+  conversations.delete(msg.chat.id);
+  return bot.sendMessage(msg.chat.id,
+    `✅ Templates for c#${conv.campaignId} → ${parsed.length} entries saved.\n\n` +
+    `Tap /settings ${conv.campaignId} to see the updated panel.`);
 }
