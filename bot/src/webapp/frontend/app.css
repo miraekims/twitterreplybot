@@ -68,8 +68,7 @@ body {
 #app { position: relative; z-index: 1; max-width: 480px; margin: 0 auto; }
 
 .screen { display: none; }
-.screen.active { display: block; animation: screen-in 0.4s cubic-bezier(.2,.8,.2,1) both; }
-@keyframes screen-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.screen.active { display: block; }
 
 /* Loading */
 #loading { text-align: center; padding-top: 38vh; }
