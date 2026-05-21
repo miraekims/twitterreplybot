@@ -172,14 +172,15 @@ async function handleApi(req, res, pathname, url) {
       const body = await readBody(req);
       let cfg = {};
       try { cfg = JSON.parse(c.config_json); } catch {}
-      // Merge provided fields
+      // Merge provided fields. Preset FIRST so user overrides (like
+      // qualityThreshold, commenterRatio) survive on top of the preset base.
       if (body.keywords !== undefined) cfg.keywords = body.keywords;
       if (body.templates !== undefined) cfg.templates = parseTemplatesFromApi(body.templates);
       if (body.persona !== undefined) cfg.persona = body.persona;
+      if (body.preset) cfg.pacing = { ...cfg.pacing, ...presetPacing(body.preset) };
       if (body.pacing !== undefined) cfg.pacing = { ...cfg.pacing, ...body.pacing };
       if (body.filters !== undefined) cfg.filters = { ...cfg.filters, ...body.filters };
       if (body.sleep !== undefined) cfg.sleep = { ...cfg.sleep, ...body.sleep };
-      if (body.preset) cfg.pacing = presetPacing(body.preset);
       db.setCampaignConfig(c.id, JSON.stringify(cfg));
       return json({ ok: true, config: cfg });
     }
