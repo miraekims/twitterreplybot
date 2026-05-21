@@ -770,8 +770,12 @@ async function runCommenterScan(client, campaign, cfg) {
         }
         // Skip very short / low-effort comments (likely bots)
         if (reply.text.length < 15) continue;
-        // Skip comments with 0 likes if the post has many replies (quality filter)
-        if ((reply.favoriteCount || 0) === 0 && replies.length > 20) continue;
+        // Skip commenters with too few followers (low visibility for our reply)
+        const minCommenterFollowers = cfg.filters?.minAuthorFollowers || 50;
+        if ((reply.authorFollowers || 0) < minCommenterFollowers) continue;
+        // Skip comments with fewer likes than threshold (nobody is reading them)
+        const minCommenterLikes = cfg.filters?.minLikes || 2;
+        if ((reply.favoriteCount || 0) < minCommenterLikes) continue;
 
         allCommenters.push({
           ...reply,
